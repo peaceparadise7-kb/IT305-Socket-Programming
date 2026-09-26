@@ -1,8 +1,8 @@
 # IT305 Socket Programming Architecture Document
 ## Fault-Tolerant Topic-Based File Distribution System
 
-**Document Status:** Approved Engineering Architecture (Refined)  
-**Version:** 1.1.0  
+**Document Status:** Approved Engineering Architecture (Final Refinement)  
+**Version:** 1.2.0  
 **Target Architecture:** POSIX / C99 (Linux/UNIX Sockets & Pthreads)
 
 ---
@@ -14,11 +14,11 @@ The system consists of a **Topic-Based File Server** and a **File Distribution C
 ```mermaid
 graph TD
     Client[Client Executable] -->|1. GET Topic Request| Server[Server Executable]
-    Server -->|2. Multi-Frame Manifest Stream| Directory[Topics Root Dir /dataset/Animals10]
+    Server -->|2. Multi-Frame Bounded Manifest| Directory[Topics Root Dir /dataset/Animals10]
     Directory -->|3. File Metadata| Server
     Server -->|4. Chunked Data Framing| Net((TCP Network Stream))
     Net -->|5. Binary Payload / Chunks| Client
-    Client -->|6. Disk Write & ACK Packet| LocalFS[Local Output Directory & Checkpoint]
+    Client -->|6. Disk Write & ACK Frame| LocalFS[Local Output Directory & Checkpoint]
     Client -->|7. MSG_ACK| Server
     Server -->|8. Commit Session Offset| SessionTable[Server Session Table]
 ```
@@ -34,50 +34,15 @@ graph TD
   - `single`: Process clients sequentially on the main thread.
   - `multi`: Main listener thread executes `accept()` and spawns detached worker threads (`pthread_create`).
 
-```mermaid
-graph LR
-    subgraph Server Concurrency Architecture
-        Listener[TCP Listener Port] -->|accept()| ModeSwitch{Mode Check}
-        ModeSwitch -->|--mode single| SeqLoop[Sequential Client Handler]
-        ModeSwitch -->|--mode multi / default| ThreadPool[Pthread Dispatcher]
-        ThreadPool -->|Worker Thread| ClientHandler[Client Session Worker]
-    end
-```
-
 ### 2.2 Dynamic Session Table Architecture
-To prevent arbitrary fixed array limitations, the server maintains a dynamic, thread-safe session table:
-
-```c
-typedef struct session_node {
-    char session_id[33];
-    char topic_name[64];
-    uint32_t committed_file_index;
-    uint64_t committed_byte_offset;
-    uint64_t total_useful_bytes;
-    time_t last_active_time;
-    struct session_node *next;
-} session_node_t;
-
-typedef struct {
-    session_node_t *buckets[256];
-    uint32_t active_sessions_count;
-    uint32_t max_allowed_sessions; // Default 4096, configurable
-    pthread_mutex_t table_lock;
-} session_table_t;
-```
+The server maintains a thread-safe dynamic session hash table (`session_table_t`), eliminating hardcoded array limits while rejecting client connections with `0x0503 ERR_SERVER_FULL` if configurable system capacity is exceeded.
 
 ---
 
-## 3. Case 2 Explicit Checkpoint Commitment Architecture
+## 3. Case 2 Checkpoint-Based Minimized Redundancy Architecture
 
-### 3.1 Checkpoint Commitment State Machine
-The system relies on an **explicit commit model** to maintain state consistency across network failures:
-
-1. **Client Payload Receive:** Client receives `MSG_DATA_CHUNK` from server.
-2. **Local Persistence:** Client writes chunk payload to disk (`write()`).
-3. **Local Checkpoint Update:** Client updates local state structure and writes to `.session_<topic>.chk`.
-4. **Acknowledgement Transmission:** Client sends `MSG_ACK` payload `(Session_ID, File_Index, Acked_Byte_Offset)`.
-5. **Server Commitment:** Server worker receives `MSG_ACK`, updates `session_table_t`, and marks the offset as *committed*.
+### 3.1 Checkpoint Commitment State Machine & Exact Semantics
+Case 2 achieves **checkpoint-based minimized redundancy** through an explicit 5-step acknowledgement commitment model:
 
 ```mermaid
 sequenceDiagram
@@ -88,12 +53,13 @@ sequenceDiagram
     participant FI as Fault Injector Engine
 
     S->>C: MSG_DATA_CHUNK (File #1, Offset=100KB, Len=64KB)
-    C->>C: 1. Write 64KB payload to disk
-    C->>C: 2. Update local .session.chk (File #1, Offset=164KB)
-    C->>S: 3. Send MSG_ACK (SessionID="S123", File=1, Offset=164KB)
-    S->>ST: 4. Lock & Update Session "S123" -> Committed Offset=164KB
+    C->>C: 1. Receive byte payload
+    C->>C: 2. Write payload to disk
+    C->>C: 3. Update local .session.chk (File #1, Offset=164KB)
+    C->>S: 4. Send MSG_ACK (SessionID="S123", File=1, Offset=164KB)
+    S->>ST: 5. Server receives MSG_ACK & commits offset 164KB
     
-    FI->>S: 5. Bernoulli Fault Injected (before write_n)
+    FI->>S: Fault Injected (before next write_n)
     S--xC: Socket Abruptly Closed!
 
     Note over C: Client detects disconnect (recv == 0)
@@ -106,48 +72,62 @@ sequenceDiagram
     S->>C: MSG_DATA_CHUNK (Stream resumes at 164KB)
 ```
 
-### 3.2 Pre-ACK Failure & Redundant Byte Semantics
-If a socket failure occurs after the client writes to disk but **before** the server processes `MSG_ACK`:
-- Server's committed offset remains $O_{last\_ack}$ (e.g. 100 KB).
-- Upon reconnection, server resumes streaming from $O_{last\_ack}$ (100 KB).
-- Client receives data starting at 100 KB, seeks local file descriptor back to 100 KB (`lseek(fd, 100000, SEEK_SET)`), and overwrites the un-ACKed bytes (100 KB–164 KB).
-- **Redundant Bytes Definition:** $B_{redundant}$ is defined strictly as payload bytes retransmitted *after* the last committed ACK offset due to un-ACKed interruptions.
+### 3.2 Commitment Rules & Redundancy Accounting
+- **Byte Commitment Definition:** A byte becomes committed ONLY after:
+  1. Client receives it,
+  2. Writes it to disk,
+  3. Updates its local checkpoint file,
+  4. Sends a `MSG_ACK` frame, and
+  5. The server receives and processes that `MSG_ACK`.
+- **Pre-ACK Failure Behavior:** If a connection failure occurs before the server commits the `MSG_ACK`, data sent after the last committed checkpoint may need to be retransmitted.
+- **Redundant Bytes ($B_{redundant}$):** Those retransmitted file payload bytes are counted as $B_{redundant}$.
+- **Checkpoint Guarantee:** Case 2 guarantees that bytes BEFORE the last committed checkpoint are NEVER retransmitted. In contrast, Case 1 restarts from the beginning (File 0, Byte 0) and can therefore retransmit a much larger amount of data.
 
 ---
 
-## 4. Probabilistic Fault Injection Engine
+## 4. Byte Accounting & Conservation Framework
 
-- **Decision Location:** The Bernoulli failure check takes place on the server **immediately before** calling `write_n()` for each data chunk.
-- **Thread Safety:** Each worker thread maintains an independent pseudo-random seed state (`rand_r(&thread_seed)` or `drand48_r()`).
-- **Seed Parameter:** Configured via `./server ... [--seed S]`. Defaults to time-based seed if omitted.
-- **Edge Behaviors:**
-  - $p = 0.0$: Fault injector disabled; 0% connection interruptions.
-  - $p = 1.0$: Connection drops on first data chunk attempt.
-  - **Client Abort Guard:** Client enforces `--max-retries N` (default 10) to prevent infinite non-progressing reconnect loops when $p=1.0$.
+All experiment measurements enforce strict byte conservation:
 
----
+$$B_{wire} = B_{useful} + B_{redundant} + B_{overhead}$$
 
-## 5. Multi-Frame Manifest Architecture
-
-For topic directories with large numbers of files, the server streams the manifest in bounded frames:
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client
-    participant S as Server
-
-    C->>S: MSG_GET_REQ (Topic="Animals10")
-    S->>C: MSG_MANIFEST_START (Files=500, TotalBytes=100MB)
-    loop For each file 1..500
-        S->>C: MSG_MANIFEST_ENTRY (Index=i, Size=s_i, Path="dog/01.jpg")
-    end
-    S->>C: MSG_MANIFEST_END (EntriesSent=500, Status=0x0200)
-```
+- **$B_{useful}$:** Net file payload bytes written to disk forming the final topic dataset.
+- **$B_{redundant}$:** Retransmitted **FILE PAYLOAD bytes ONLY** sent after the last committed checkpoint.
+- **$B_{overhead}$:** Every transmitted application-protocol byte that is NOT file payload data, including:
+  - All 12-byte application headers,
+  - Manifest frame payloads (`MSG_MANIFEST_START`, `MSG_MANIFEST_ENTRY`, `MSG_MANIFEST_END`),
+  - ACK frames (`MSG_ACK`),
+  - Error and control frames (`MSG_ERROR`, `MSG_GET_REQ`, `MSG_RANGE_REQ`, `MSG_TRANSFER_DONE`),
+  - Application headers belonging to retransmitted data chunks.
 
 ---
 
-## 6. Checksum Architecture
+## 5. Case 2 Enhanced Architecture: Multi-Stream Parallel TCP
 
-1. **Local Checkpoint Protection (CRC32):** The client checkpoint file `.session_<topic>.chk` contains a CRC32 header checksum to detect local disk corruption of checkpoint records.
-2. **File Integrity (SHA-256):** End-to-end payload verification is handled independently post-transfer by comparing source and downloaded directory SHA-256 hashes (`diff -r` or `sha256sum`).
+### 5.1 Detailed Design Mechanics
+1. **Configurable Parallel Streams ($K$):** Client establishes $K$ concurrent TCP socket connections (default $K=4$, configurable via `--parallel-streams K`).
+2. **Chunk Range Queue & Overlap Prevention:** Server manifest is partitioned into a thread-safe work-queue of disjoint range chunks $[start\_offset, end\_offset)$. Worker streams pull range chunks dynamically; overlap is strictly prevented by atomic range reservation.
+3. **Completed Range Tracking:** Client maintains an in-memory range map per file. Ranges are marked completed upon disk write and ACK commit.
+4. **Stream Failure Recovery:** If stream $i$ suffers a socket disconnect, its active un-ACKed range chunk is returned to the work-queue for re-assignment to another active stream.
+5. **Session Checkpoint Integration:** The client checkpoint file records the highest contiguous completed byte offset across streams to ensure consistent session resume.
+6. **Topic Completion Detection:** Transfer completes when all file ranges in the manifest map are marked 100% completed and committed.
+
+### 5.2 Alternatives Considered
+
+| Approach | Architecture Description | Tradeoffs & Evaluation |
+| :--- | :--- | :--- |
+| **1. Single Blocking TCP Stream** | Sequential read/write loop on blocking socket. | Simple implementation; vulnerable to TCP head-of-line blocking and link underutilization over lossy links. |
+| **2. Single Non-Blocking TCP Stream** | Reactor pattern using `epoll`/`select` on one socket. | Eliminates thread-per-client overhead, but single TCP connection window still stalls on packet loss. |
+| **3. Pipelined Requests over Single Socket** | Multiple GET/Range requests queued over 1 socket. | Reduces round-trip latency, but a single lost segment stalls the entire pipeline. |
+| **4. Multi-Stream TCP Parallel Ranges (Chosen)** | $K$ parallel TCP sockets requesting disjoint byte ranges using non-blocking I/O. | **Chosen Architecture:** Bypasses single-connection TCP congestion bottlenecks and isolates connection drops to individual stream ranges. |
+
+*Note:* Enhanced performance is evaluated empirically through experimental measurement; no fixed percentage throughput gain is assumed.
+
+---
+
+## 6. Multi-Frame Bounded Manifest Architecture
+
+To prevent framing buffer overflow:
+- **Maximum Path Length:** Relative file paths must not exceed $MAX\_PATH\_LEN = 4096$ bytes.
+- **Frame Size Guarantee:** Each `MSG_MANIFEST_ENTRY` frame (12B header + 4B file index + 8B file size + 2B path length + $N$ bytes path) fits well within $MAX\_PAYLOAD\_LEN = 65536$ bytes.
+- **Path Length Rejection:** If a file relative path exceeds 4096 bytes, the server aborts manifest creation and returns `MSG_ERROR` (code `0x0400 ERR_PATH_TOO_LONG`).

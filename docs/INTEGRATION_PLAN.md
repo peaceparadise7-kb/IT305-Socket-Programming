@@ -1,8 +1,8 @@
 # IT305 Six-Workstream Integration Plan
 ## Parallel Development Strategy & Collaborative Engineering Framework
 
-**Document Status:** Approved Integration Strategy (Refined)  
-**Version:** 1.1.0  
+**Document Status:** Approved Integration Strategy (Final Refinement)  
+**Version:** 1.2.0  
 **Team Structure:** 6 Logical Workstreams
 
 ---
@@ -37,10 +37,10 @@ graph TD
 
 All six workstreams rely on common interfaces defined by Workstream 1:
 
-- `src/common/protocol.h`: Defines packet types (`MSG_MANIFEST_START`, `MSG_MANIFEST_ENTRY`, `MSG_MANIFEST_END`, `MSG_ACK`), 12-byte binary header with 32-bit sequence number, bit flags, error codes, `read_n()`, `write_n()`.
+- `src/common/protocol.h`: Defines packet types (`MSG_MANIFEST_START`, `MSG_MANIFEST_ENTRY`, `MSG_MANIFEST_END`, `MSG_ACK`), 12-byte binary header with 32-bit sequence number, bit flags, error codes, `MAX_PATH_LEN = 4096`, `read_n()`, `write_n()`.
 - `src/common/checksum.h`: Lightweight CRC32 checkpoint validation functions.
 - `src/common/utils.h`: Dynamic path formatting, monotonic timing helpers, synchronized logging.
-- `src/server/session_mgr.h`: Thread-safe dynamic session hash table and explicit `MSG_ACK` commitment functions.
+- `src/server/session_mgr.h`: Thread-safe dynamic session hash table and explicit `MSG_ACK` commitment functions for checkpoint-based minimized redundancy.
 
 ---
 

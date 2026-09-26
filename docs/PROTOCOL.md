@@ -1,8 +1,8 @@
 # IT305 Wire Protocol Specification
 ## Application Layer Framing Protocol for Topic-Based File Transfer
 
-**Document Status:** Approved Wire Protocol Standard (Refined)  
-**Version:** 1.1.0  
+**Document Status:** Approved Wire Protocol Standard (Final Refinement)  
+**Version:** 1.2.0  
 **Byte Order:** Network Byte Order (Big-Endian) for all numeric binary fields
 
 ---
@@ -14,7 +14,8 @@ TCP provides a continuous byte stream without application-level frame boundaries
 2. **32-Bit Sequence Number:** The header contains an explicit 32-bit packet sequence number (`seq_num`).
 3. **Payload Length Prefix:** The header specifies payload length $L$ (0 to 65,536 bytes).
 4. **Payload Offsets:** All 64-bit file byte offsets (`uint64_t`) are explicitly serialized inside packet payloads.
-5. **Strict Reader Loop (`read_n`):** Receivers MUST loop over `recv()` until exactly 12 bytes of header are read before decoding payload length $L$, and then loop until all $L$ bytes of payload are consumed.
+5. **Path Length Limit:** File relative path strings MUST NOT exceed $MAX\_PATH\_LEN = 4096$ bytes to guarantee that `MSG_MANIFEST_ENTRY` payloads remain strictly within $MAX\_PAYLOAD\_LEN = 65536$ bytes.
+6. **Strict Reader Loop (`read_n`):** Receivers MUST loop over `recv()` until exactly 12 bytes of header are read before decoding payload length $L$, and then loop until all $L$ bytes of payload are consumed.
 
 ---
 
@@ -74,22 +75,13 @@ TCP provides a continuous byte stream without application-level frame boundaries
   | Resume File Index (uint32_t, 4B)  | Resume Byte Offset (uint64_t, 8B) |
   +-----------------------------------+-----------------------------------+
   ```
-- **Semantics:** If `FLAG_RESUME` is set and `Session ID` is valid, server resumes from `(Resume File Index, Resume Byte Offset)`.
 
 ---
 
 ### 4.2 Multi-Frame Manifest Sequence (0x02, 0x09, 0x0A)
-To handle directories with arbitrary numbers of files without exceeding `payload_len <= 65536`:
 
 #### `MSG_MANIFEST_START` (0x02)
-- **Payload Layout:**
-  ```
-  +-----------------------------------+-----------------------------------+
-  | Status Code (uint16_t, 2B)        | Session ID (Null-Term, 33 Bytes)  |
-  +-----------------------------------+-----------------------------------+
-  | Total Files (uint32_t, 4B)        | Total Topic Bytes (uint64_t, 8B)  |
-  +-----------------------------------+-----------------------------------+
-  ```
+- **Payload Layout:** Status Code (uint16_t), Session ID (33B string), Total Files (uint32_t), Total Bytes (uint64_t).
 
 #### `MSG_MANIFEST_ENTRY` (0x09) — Repeated per file
 - **Payload Layout:**
@@ -100,26 +92,15 @@ To handle directories with arbitrary numbers of files without exceeding `payload
   | Path String Length (uint16_t, 2B) | Relative Path String (Var-len)    |
   +-----------------------------------+-----------------------------------+
   ```
+- **Path Length Rule:** `Path String Length` MUST NOT exceed $MAX\_PATH\_LEN = 4096$ bytes. If a file path exceeds 4096 bytes, the server aborts manifest creation and returns `MSG_ERROR` (code `0x0400 ERR_PATH_TOO_LONG`).
 
 #### `MSG_MANIFEST_END` (0x0A)
-- **Payload Layout:**
-  ```
-  +-----------------------------------+-----------------------------------+
-  | Total Entries Sent (uint32_t, 4B) | Final Manifest Status (uint16, 2B)|
-  +-----------------------------------+-----------------------------------+
-  ```
+- **Payload Layout:** Total Entries Sent (uint32_t), Final Manifest Status (uint16_t).
 
 ---
 
 ### 4.3 `MSG_FILE_HEADER` (0x03) — File Start Indicator
-- **Payload Layout:**
-  ```
-  +-----------------------------------+-----------------------------------+
-  | File Index (uint32_t, 4B)         | Start Byte Offset (uint64_t, 8B)  |
-  +-----------------------------------+-----------------------------------+
-  | Total File Size (uint64_t, 8B)    | Relative Path (Null-Term String)  |
-  +-----------------------------------+-----------------------------------+
-  ```
+- **Payload Layout:** File Index (uint32_t), Start Byte Offset (uint64_t), Total File Size (uint64_t), Relative Path (Null-Term String).
 
 ---
 
@@ -131,42 +112,22 @@ To handle directories with arbitrary numbers of files without exceeding `payload
 
 ### 4.5 `MSG_ACK` (0x05) — Explicit Checkpoint Commitment ACK
 - **Direction:** Client $\rightarrow$ Server
-- **Payload Layout:**
-  ```
-  +-----------------------------------+-----------------------------------+
-  | Session ID (Null-Term, 33 Bytes)  | File Index (uint32_t, 4B)         |
-  +-----------------------------------+-----------------------------------+
-  | Acked Byte Offset (uint64_t, 8B)  | CRC32 Checkpoint Checksum (4B)   |
-  +-----------------------------------+-----------------------------------+
-  ```
-- **Semantics:** Client sends this packet ONLY AFTER writing chunk data to disk and updating local checkpoint. Server updates its session record upon receipt. Duplicate ACKs are idempotent.
+- **Payload Layout:** Session ID (33B string), File Index (uint32_t), Acked Byte Offset (uint64_t), CRC32 Checkpoint Checksum (uint32_t).
+- **Semantics:** Sent ONLY AFTER client receives chunk, writes payload to disk, and updates local checkpoint. Server commits offset upon receipt.
 
 ---
 
 ### 4.6 `MSG_TRANSFER_DONE` (0x06) & `MSG_ERROR` (0x07)
 - `MSG_TRANSFER_DONE` carries `Session ID` (33B) and `Total Payload Bytes Sent` (uint64_t).
-- `MSG_ERROR` carries `Error Code` (uint16_t) and `Error Message` string (`0x0404`: Topic Not Found, `0x0400`: Bad Magic, `0x0503`: Session Table Full).
+- `MSG_ERROR` carries `Error Code` (uint16_t) and `Error Message` string:
+  - `0x0400`: Protocol Error / Path Too Long ($> 4096$ bytes).
+  - `0x0404`: Topic Directory Not Found.
+  - `0x0503`: Server Session Table Full.
 
 ---
 
-## 5. Protocol State Machine & Failure Scenarios
+## 5. Case 2 Checkpoint-Based Minimized Redundancy Semantics
 
-```mermaid
-stateDiagram-v2
-    [*] --> Idle
-    Idle --> ManifestStream: Send MSG_GET_REQ
-    ManifestStream --> FileTransfer: MSG_MANIFEST_END
-    FileTransfer --> SendingACK: Recv MSG_DATA_CHUNK & Write Disk
-    SendingACK --> FileTransfer: Send MSG_ACK to Server
-    FileTransfer --> Complete: Final File ACKed
-    
-    SendingACK --> Disconnected: Connection Interrupted
-    FileTransfer --> Disconnected: Connection Interrupted
-    Disconnected --> Idle: Reconnect with Last Committed ACK Offset
-```
-
-### Explicit Scenarios & Edge Cases
-1. **Failure Before ACK:** Client writes to disk but socket closes before `MSG_ACK` reaches server. Server session retains previous committed offset $O_{committed}$. Client reconnects with request at $O_{committed}$. Server resumes at $O_{committed}$; client overwrites un-ACKed local trailing bytes.
-2. **Duplicate ACK:** Server receives duplicate `MSG_ACK` due to network reordering. Server treats operation as idempotent and updates timestamp.
-3. **File Boundary Resume:** When file $k$ completes, client sends `MSG_ACK` with `File Index = k` and `Acked Offset = FileSize_k`. Resume resumes at `File Index = k+1`, `Offset = 0`.
-4. **Final Chunk Resume:** If failure occurs on final chunk before ACK commit, resume requests start offset of final chunk.
+1. **Commitment Chain:** A byte becomes committed ONLY after: client receives it $\rightarrow$ writes it to disk $\rightarrow$ updates local checkpoint $\rightarrow$ sends `MSG_ACK` $\rightarrow$ server receives/processes `MSG_ACK`.
+2. **Pre-ACK Failure Behavior:** If a failure occurs before the server commits the `MSG_ACK`, data sent after the last committed checkpoint may need to be retransmitted. Those retransmitted file payload bytes are counted as $B_{redundant}$.
+3. **Checkpoint Guarantee:** Case 2 guarantees that bytes BEFORE the last committed checkpoint are NEVER retransmitted. In contrast, Case 1 restarts from the beginning (File 0, Byte 0) and retransmits much larger data.

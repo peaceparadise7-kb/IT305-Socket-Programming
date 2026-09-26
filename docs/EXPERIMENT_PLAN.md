@@ -1,8 +1,8 @@
 # IT305 Performance Experimentation Plan
 ## Measurement Methodology & Empirical Evaluation Framework
 
-**Document Status:** Approved Experimentation Plan (Refined)  
-**Version:** 1.1.0  
+**Document Status:** Approved Experimentation Plan (Final Refinement)  
+**Version:** 1.2.0  
 **Testbed Infrastructure:** 3 Dedicated Physical/Virtual Linux Machines (1 Server Node, 2 Client Nodes)
 
 ---
@@ -11,8 +11,8 @@
 
 The experimentation framework quantitatively measures, evaluates, and compares:
 1. Concurrency scalability of Single-Threaded vs. Multi-Threaded server models (Part I).
-2. Cost of redundant retransmissions in un-sessioned transfers under connection failures (Part II Case 1).
-3. Efficiency of zero-redundancy checkpointing with ACK commitments in session-managed transfers (Part II Case 2).
+2. Cost of full retransmissions in un-sessioned transfers under connection failures (Part II Case 1).
+3. Efficiency of checkpoint-based minimized redundancy in session-managed transfers (Part II Case 2).
 4. Performance characteristics of multi-stream non-blocking streaming (Part II Case 2 Enhanced).
 
 ---
@@ -26,14 +26,19 @@ The experimentation framework quantitatively measures, evaluates, and compares:
 - **Dataset Topic:** Animals10 dataset subfolders (e.g. `dog`, `cat`, `butterfly`).
 - **Transfer Case:** Part I, Part II Case 1, Part II Case 2, Part II Case 2 Enhanced.
 
-### 2.2 Dependent Variables & Mutually Consistent Equations
-- **Wire Bytes ($B_{wire}$):** Total bytes sent/received across TCP sockets.
-- **Useful Bytes ($B_{useful}$):** Net payload bytes written to disk forming target files.
-- **Protocol Overhead Bytes ($B_{overhead}$):** Sum of 12-byte headers and control frames (`MANIFEST_*`, `ACK`, `MSG_ERROR`). Protocol headers are classified under $B_{overhead}$, NOT $B_{redundant}$.
-- **Redundant Bytes ($B_{redundant}$):** File payload bytes retransmitted *after* the last committed ACK offset due to un-ACKed interruptions.
+### 2.2 Dependent Variables & Precise Byte Accounting
+- **Useful Bytes ($B_{useful}$):** Net file payload bytes successfully received and written to disk forming the requested dataset.
+- **Redundant Bytes ($B_{redundant}$):** Retransmitted **FILE PAYLOAD bytes ONLY** that are sent after the last committed checkpoint due to un-ACKed connection failures.
+- **Protocol Overhead Bytes ($B_{overhead}$):** Every transmitted application-protocol byte that is NOT file payload data, including:
+  - All 12-byte application headers,
+  - Manifest frame payloads (`MSG_MANIFEST_START`, `MSG_MANIFEST_ENTRY`, `MSG_MANIFEST_END`),
+  - ACK frames (`MSG_ACK`),
+  - Error and control frames (`MSG_ERROR`, `MSG_GET_REQ`, `MSG_RANGE_REQ`, `MSG_TRANSFER_DONE`),
+  - Application headers belonging to retransmitted data chunks.
+- **Wire Bytes ($B_{wire}$):** Total bytes transmitted across the TCP socket interface.
 - **Conservation Equation:**
   $$B_{wire} = B_{useful} + B_{redundant} + B_{overhead}$$
-- **Completion Time ($T_{comp}$):** Wall-clock seconds (`clock_gettime(CLOCK_MONOTONIC)`) from initial request to final receipt.
+- **Completion Time ($T_{comp}$):** Total wall-clock seconds (`clock_gettime(CLOCK_MONOTONIC)`) from initial request to final topic completion signal.
 - **Effective Throughput ($R_{eff}$):**
   $$R_{eff} = \frac{B_{useful}}{T_{comp}} \quad \text{(Mbps)}$$
 
@@ -68,8 +73,8 @@ part_case,num_clients,failure_prob,trial_id,completion_time_sec,useful_bytes,tot
 Part1_Single,1,0.00,1,2.451,52428800,52430000,0,1200,171.12
 Part1_Multi,8,0.00,1,3.120,419430400,419445000,0,14600,1075.46
 Part2_Case1,4,0.10,1,12.840,209715200,384910000,175180000,14800,130.66
-Part2_Case2,4,0.10,1,4.520,209715200,209730000,0,14800,371.17
-Part2_Case2_Enhanced,4,0.10,1,3.210,209715200,209735000,0,19800,522.65
+Part2_Case2,4,0.10,1,4.520,209715200,209730000,128000,16800,371.17
+Part2_Case2_Enhanced,4,0.10,1,3.210,209715200,209735000,64000,21800,522.65
 ```
 
 ---

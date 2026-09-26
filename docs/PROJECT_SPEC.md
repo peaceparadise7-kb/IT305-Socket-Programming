@@ -1,8 +1,8 @@
 # IT305 Socket Programming Course Project Specification
 ## Fault-Tolerant Topic-Based File Distribution Service
 
-**Document Status:** Approved Engineering Specification (Refined)  
-**Version:** 1.1.0  
+**Document Status:** Approved Engineering Specification (Final Refinement)  
+**Version:** 1.2.0  
 **Repository:** IT305-Socket-Programming  
 **Target Platform:** POSIX-compliant UNIX/Linux Systems (C99 / GCC)
 
@@ -20,9 +20,10 @@ The specification covers both **Part I** (Single-threaded and Multi-threaded top
 
 ### 2.1 Topic-Based File Distribution (Part I & Part II)
 - **FR-1.1 Topic Mapping:** The server shall dynamically map a user-requested topic name (e.g., `dog`, `cat`, `elephant`) to a physical filesystem directory located under `<topics_root_dir>/<topic>/`.
-- **FR-1.2 Topic Directory Inspection & Multi-Frame Manifest:** Upon receiving a valid topic request (`GET <topic>`), the server shall scan the directory, build a file manifest, and stream the manifest to the client using a multi-frame sequence (`MANIFEST_START`, repeating `MANIFEST_ENTRY`, `MANIFEST_END`). This prevents payload size overflow for directories with large file counts.
-- **FR-1.3 Invalid Topic Handling:** If a client requests a topic directory that does not exist or is unreadable, the server shall respond with an explicit error frame (`MSG_ERROR`, code `0x0404`) and gracefully terminate the request.
-- **FR-1.4 Data Integrity:** Files received by the client must match the server's source files byte-for-byte upon completion. Relative directory structures within topic folders must be preserved.
+- **FR-1.2 Topic Directory Inspection & Bounded Multi-Frame Manifest:** Upon receiving a valid topic request (`GET <topic>`), the server shall scan the directory, build a file manifest, and stream the manifest using a multi-frame sequence (`MSG_MANIFEST_START`, repeating `MSG_MANIFEST_ENTRY`, `MSG_MANIFEST_END`).
+- **FR-1.3 Manifest Relative Path Length Limit:** The server enforces a maximum relative path length of $MAX\_PATH\_LEN = 4096$ bytes per file entry. If any file path exceeds 4096 bytes or causes a frame to exceed $MAX\_PAYLOAD\_LEN = 65536$ bytes, the server shall abort manifest creation and return an explicit error frame (`MSG_ERROR`, code `0x0400 ERR_PATH_TOO_LONG`).
+- **FR-1.4 Invalid Topic Handling:** If a requested topic directory does not exist or is unreadable, the server shall respond with `MSG_ERROR` (code `0x0404 ERR_TOPIC_NOT_FOUND`) and close the connection.
+- **FR-1.5 Data Integrity:** Files received by the client must match the server's source files byte-for-byte upon completion. Relative directory structures within topic folders must be preserved.
 
 ### 2.2 Concurrency Architecture (Part I)
 - **FR-2.1 Concurrency Modes:**
@@ -38,25 +39,28 @@ The specification covers both **Part I** (Single-threaded and Multi-threaded top
   - The Bernoulli failure decision occurs on the server per data chunk **immediately before** invoking socket write (`write_n()`).
   - At $p = 0.0$, zero artificial failures are injected. At $p = 1.0$, connection drops on the first chunk attempt (client max retry limit enforces abort to prevent infinite non-progressing loops).
   - Interruption is executed by abruptly closing (`close()`) or shutting down (`shutdown(fd, SHUT_RDWR)`) the active client socket mid-stream.
-- **FR-3.2 Case 1: No Session Management:**
+- **FR-3.2 Case 1: No Session Management (Full Retransmission Restart):**
   - Upon connection drop, the client detects disconnection (`recv()` returns 0 or error).
   - Client automatically reconnects to the server with a clean session request.
   - The transfer restarts completely from the beginning (File 0, Byte Offset 0).
-  - All previously received bytes for that topic are overwritten, resulting in measured **redundant retransmissions**.
-- **FR-3.3 Case 2: Session Management & Explicit Checkpoint Commitment:**
-  - **Committed Transfer Definition:** A byte offset is considered *successfully transferred and committed* ONLY when:
-    1. Client receives the data chunk.
+  - All previously received data for that topic must be retransmitted from the beginning, resulting in significant **redundant retransmissions**.
+- **FR-3.3 Case 2: Session Management & Checkpoint-Based Minimized Redundancy:**
+  - **Commitment Semantics:** A byte becomes committed ONLY after:
+    1. Client receives the byte payload.
     2. Client writes the payload to disk.
     3. Client updates its local checkpoint file (`.session_<topic>.chk`).
-    4. Client sends a `MSG_ACK` packet containing `(Session_ID, File_Index, Committed_Byte_Offset)`.
-    5. Server receives `MSG_ACK` and updates its session record.
-  - **Pre-ACK Failure Behavior:** If a failure occurs before `MSG_ACK` is committed by the server, the server retains the last committed offset $O_{last\_ack}$. Upon reconnection, the server resumes streaming from $O_{last\_ack}$. The client receives data starting at $O_{last\_ack}$ and overwrites un-ACKed trailing local bytes.
-  - **Redundant Retransmission Definition:** Redundant bytes are precisely defined as **payload data retransmitted after the last committed checkpoint** due to un-ACKed network interruptions.
+    4. Client sends a `MSG_ACK` frame.
+    5. Server receives and processes that `MSG_ACK`.
+  - **Pre-ACK Failure Behavior:** If a failure occurs before the server commits the `MSG_ACK`, data sent after the last committed checkpoint may need to be retransmitted.
+  - **Redundant Retransmission Definition:** Those retransmitted file payload bytes are counted as $B_{redundant}$.
+  - **Checkpoint Guarantee:** Case 2 guarantees that bytes BEFORE the last committed checkpoint are NEVER retransmitted. Case 1 restarts from the beginning and can therefore retransmit a much larger amount of data.
 
-### 2.4 Case 2 Enhanced: Performance Optimization
-- **FR-4.1 Selected Enhancement: Multi-Stream Parallel TCP Range Streaming with Non-Blocking I/O (`epoll`/`select`)**:
-  - Rather than a single sequential TCP pipe, the enhanced client establishes $K$ concurrent TCP connections for a requested topic, issuing ranged chunk requests across topic files using non-blocking socket I/O.
-  - *Evaluation Criteria:* System performance is evaluated by measuring total completion time and effective throughput across varying failure probabilities $p$, comparing Case 2 Enhanced directly against standard Case 2.
+### 2.4 Case 2 Enhanced: Multi-Stream Non-Blocking Range Streaming
+- **FR-4.1 Enhancement Architecture:** Multi-stream parallel TCP connections with non-blocking socket I/O (`epoll`/`select`).
+- **FR-4.2 Configurable Stream Count:** Number of parallel streams $K$ is configurable via CLI (default $K=4$).
+- **FR-4.3 Disjoint Range Assignment:** Parallel streams pull non-overlapping chunk ranges $[start\_offset, end\_offset)$ from a synchronized work-queue.
+- **FR-4.4 Failure Recovery & Checkpointing:** If stream $i$ fails, its un-ACKed range chunk is returned to the work-queue. Checkpoints commit the contiguous completed byte offsets across streams.
+- **FR-4.5 Objective Measurement:** Performance characteristics (completion time, throughput, overhead) are evaluated experimentally against standard Case 2; no fixed percentage improvement is assumed.
 
 ---
 
@@ -68,28 +72,16 @@ The specification covers both **Part I** (Single-threaded and Multi-threaded top
 ```bash
 ./server <port> <topics_root_dir> [--mode single|multi]
 ```
-- `<port>`: Integer TCP port to bind (1024–65535).
-- `<topics_root_dir>`: Path to root topic directory.
-- `[--mode single|multi]`: Optional trailing argument. Defaults to `multi` if omitted, strictly matching mandatory `./server <port> <topics_root_dir>` signature.
 
 #### Part II Server (Case 1, Case 2, Case 2 Enhanced)
 ```bash
 ./server <port> <topics_root_dir> <failure_probability> [--seed <uint32>]
 ```
-- `<port>`: Integer TCP port to bind.
-- `<topics_root_dir>`: Path to root topic folder.
-- `<failure_probability>`: Floating-point value $p \in [0.0, 1.0]$.
-- `[--seed <uint32>]`: Optional trailing seed for deterministic pseudo-random fault generation during test automation.
 
 ### 3.2 Client CLI (All Parts & Cases)
 ```bash
-./client <server_ip> <server_port> <topic> <output_dir> [--max-retries <N>]
+./client <server_ip> <server_port> <topic> <output_dir> [--max-retries <N>] [--parallel-streams <K>]
 ```
-- `<server_ip>`: IPv4 address of target server.
-- `<server_port>`: TCP port of target server.
-- `<topic>`: Name of requested topic subfolder.
-- `<output_dir>`: Local destination directory.
-- `[--max-retries <N>]`: Optional trailing argument (default: 10) to prevent infinite retry loops when $p=1.0$ or server is unreachable.
 
 ---
 
@@ -99,22 +91,27 @@ The specification covers both **Part I** (Single-threaded and Multi-threaded top
 - **NFR-2 Zero Hardcoding:** Zero hardcoded IPs, ports, filesystem paths, or topic names.
 - **NFR-3 Protocol Robustness:** Protocol explicitly handles partial TCP reads (`recv()`) and writes (`send()`). Framing headers use network byte order (`htonl`/`ntohl`).
 - **NFR-4 Resource Protection:** Memory allocated via `malloc()` is freed. Sockets (`close()`), file descriptors (`close()`), directory handles (`closedir()`), and mutexes are cleanly cleaned up on all exit and error paths.
-- **NFR-5 Dynamic Session Storage:** Server session table uses a thread-safe, dynamically allocated structure (or documented max capacity with overflow error response `0x0503 ERR_SERVER_FULL`).
+- **NFR-5 Path Length Safety:** Relative file paths must not exceed $MAX\_PATH\_LEN = 4096$ bytes.
 
 ---
 
 ## 5. Experimental Measurement & Metrics Requirements
 
 ### 5.1 Mutually Consistent Metrics Definitions
-- **Wire Bytes ($B_{wire}$):** Total bytes transmitted across the TCP socket (Headers + Control Frames + Payload Data + Retransmissions).
-- **Useful Bytes ($B_{useful}$):** Net topic payload bytes successfully written to disk.
-- **Overhead Bytes ($B_{overhead}$):** Sum of 12-byte header fields and control frame payloads (`MANIFEST_*`, `ACK`, `MSG_ERROR`).
-- **Redundant Bytes ($B_{redundant}$):** File payload bytes retransmitted *after* the last committed checkpoint due to un-ACKed socket failures.
-- **Consistency Conservation Equation:**
+- **Useful Bytes ($B_{useful}$):** Net topic file payload bytes successfully received and written to disk forming the requested dataset.
+- **Redundant Bytes ($B_{redundant}$):** Retransmitted **FILE PAYLOAD bytes ONLY** that are sent after the last committed checkpoint due to un-ACKed connection failures.
+- **Protocol Overhead Bytes ($B_{overhead}$):** Every transmitted application-protocol byte that is NOT file payload data, including:
+  - All 12-byte application headers,
+  - Manifest frame payloads (`MSG_MANIFEST_START`, `MSG_MANIFEST_ENTRY`, `MSG_MANIFEST_END`),
+  - ACK frames (`MSG_ACK`),
+  - Error/control frames (`MSG_ERROR`, `MSG_GET_REQ`, `MSG_RANGE_REQ`, `MSG_TRANSFER_DONE`),
+  - Application headers belonging to retransmitted data chunks.
+- **Wire Bytes ($B_{wire}$):** Total bytes transmitted across the TCP socket interface.
+- **Conservation Equation:**
   $$B_{wire} = B_{useful} + B_{redundant} + B_{overhead}$$
-- **Completion Time ($T_{comp}$):** Wall-clock seconds from initial request to final completion acknowledgement.
+- **Completion Time ($T_{comp}$):** Total wall-clock seconds from initial GET request to final topic completion signal.
 - **Effective Throughput ($R_{eff}$):**
-  $$R_{eff} = \frac{B_{useful}}{T_{comp}} \quad \text{(bytes/sec or Mbps)}$$
+  $$R_{eff} = \frac{B_{useful}}{T_{comp}} \quad \text{(Mbps)}$$
 
 ---
 

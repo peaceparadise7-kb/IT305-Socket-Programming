@@ -7,7 +7,7 @@ This document specifies mandatory working rules, coding standards, and operation
 
 ## 1. Project Purpose & Scope
 
-This codebase implements a **Fault-Tolerant Topic-Based File Distribution Service** written in POSIX C99. It supports sequential (single-threaded) and concurrent (multi-threaded) file serving, probabilistic fault injection, un-sessioned restart (Part II Case 1), session-based checkpoint resume with explicit ACK commitments (Part II Case 2), and multi-stream non-blocking streaming (Part II Case 2 Enhanced).
+This codebase implements a **Fault-Tolerant Topic-Based File Distribution Service** written in POSIX C99. It supports sequential (single-threaded) and concurrent (multi-threaded) file serving, probabilistic fault injection, un-sessioned restart (Part II Case 1), session-based checkpoint resume with explicit ACK commitments and checkpoint-based minimized redundancy (Part II Case 2), and multi-stream non-blocking streaming (Part II Case 2 Enhanced).
 
 ---
 
@@ -21,8 +21,8 @@ This codebase implements a **Fault-Tolerant Topic-Based File Distribution Servic
 - The application framing protocol defined in `docs/PROTOCOL.md` is the single source of truth.
 - Header layout is strictly 12 bytes: `[Magic(2B: 0x4954) | Type(1B) | Flags(1B) | PayloadLen(4B) | SeqNum(4B)]`.
 - `SeqNum` is a 32-bit packet sequence number. All 64-bit file byte offsets (`uint64_t`) are explicitly serialized inside packet payloads.
-- Manifest streaming uses a multi-frame sequence (`MSG_MANIFEST_START`, `MSG_MANIFEST_ENTRY`, `MSG_MANIFEST_END`).
-- Checkpoint commits require an explicit client `MSG_ACK` frame.
+- Manifest streaming uses a multi-frame sequence (`MSG_MANIFEST_START`, `MSG_MANIFEST_ENTRY`, `MSG_MANIFEST_END`) with relative paths limited to $MAX\_PATH\_LEN = 4096$ bytes.
+- Checkpoint commits require an explicit client `MSG_ACK` frame. Case 2 enforces checkpoint-based minimized redundancy.
 - **DO NOT** modify binary packet headers, message codes, byte order conversions (`htonl`/`ntohl`), or payload layouts without updating `docs/PROTOCOL.md`.
 
 ### Rule 3: Robust TCP Byte Stream Handling
@@ -70,5 +70,5 @@ This codebase implements a **Fault-Tolerant Topic-Based File Distribution Servic
 
 ### Client Executable
 ```bash
-./client <server_ip> <server_port> <topic> <output_dir> [--max-retries <N>]
+./client <server_ip> <server_port> <topic> <output_dir> [--max-retries <N>] [--parallel-streams <K>]
 ```

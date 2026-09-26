@@ -1,8 +1,8 @@
 # IT305 Implementation Plan
 ## Fault-Tolerant Topic-Based File Distribution System
 
-**Document Status:** Approved Master Implementation Roadmap (Refined)  
-**Version:** 1.1.0  
+**Document Status:** Approved Master Implementation Roadmap (Final Refinement)  
+**Version:** 1.2.0  
 **Phases:** 8 Sequential Implementation & Verification Phases
 
 ---
@@ -14,7 +14,7 @@ graph TD
     P0[Phase 0: Design & Core Infrastructure] --> P1[Phase 1: Part I Single-Threaded]
     P1 --> P2[Phase 2: Part I Multi-Threaded]
     P2 --> P3[Phase 3: Part II Case 1 - Fault Injection & Restart]
-    P3 --> P4[Phase 4: Part II Case 2 - Session & ACK Checkpointing]
+    P3 --> P4[Phase 4: Part II Case 2 - Session & Checkpoint Commitment]
     P4 --> P5[Phase 5: Part II Case 2 Enhanced - Multi-Stream]
     P5 --> P6[Phase 6: Experimentation & Data Collection]
     P6 --> P7[Phase 7: Integration, Verification & Final Submission]
@@ -24,13 +24,13 @@ graph TD
 
 ## Phase 0: Core Infrastructure & Protocol Library
 
-- **Objective:** Implement 12-byte header serialization, sequence number management, explicit `uint64_t` payload offset serialization, multi-frame manifest structures, socket helper routines (`read_n`, `write_n`), and CRC32 checkpoint validation.
+- **Objective:** Implement 12-byte header serialization, sequence number management, explicit `uint64_t` payload offset serialization, multi-frame manifest structures with $MAX\_PATH\_LEN = 4096$ validation, socket helper routines (`read_n`, `write_n`), and CRC32 checkpoint validation.
 - **Modules & Files:**
   - `docs/*`, `AGENTS.md`
   - `src/common/protocol.h`, `src/common/protocol.c`
   - `src/common/utils.h`, `src/common/utils.c`
   - `src/common/checksum.h`, `src/common/checksum.c`
-- **Acceptance Criteria:** Header serialization functions pass unit tests. Multi-frame manifest functions encode/decode correctly. Zero compiler warnings under GCC `-Wall -Wextra -Werror -pedantic`.
+- **Acceptance Criteria:** Header serialization functions pass unit tests. Multi-frame manifest functions encode/decode correctly and reject paths $> 4096$ bytes with `0x0400 ERR_PATH_TOO_LONG`. Zero compiler warnings under GCC `-Wall -Wextra -Werror -pedantic`.
 
 ---
 
@@ -42,7 +42,6 @@ graph TD
   - `Part1/server.c`
   - `Part1/client.c`
   - `Part1/Makefile`
-- **Dependencies:** Phase 0 core library.
 - **Acceptance Criteria:**
   - `./server <port> <topics_root> --mode single` handles clients sequentially.
   - Client command `./client <server_ip> <port> <topic> <out_dir>` successfully downloads topic files.
@@ -56,14 +55,13 @@ graph TD
 - **Modules & Files:**
   - `src/server/server_core.h / .c`
   - Update `Part1/server.c` (defaults to multi-threaded execution).
-- **Dependencies:** Phase 1 topic manager & framing core.
 - **Acceptance Criteria:**
   - 10 concurrent clients execute transfers simultaneously without blocking or corrupted files.
   - Passes Valgrind memory leak audit without unclosed sockets or leaks.
 
 ---
 
-## Phase 3: Part II Case 1 — Fault Injection & Restart
+## Phase 3: Part II Case 1 — Fault Injection & Full Restart
 
 - **Objective:** Introduce command-line failure probability $p \in [0.0, 1.0]$, per-chunk Bernoulli fault generator, seed support `--seed`, and un-sessioned restart behavior.
 - **Modules & Files:**
@@ -71,7 +69,6 @@ graph TD
   - `Part2_Case1/server.c`
   - `Part2_Case1/client.c`
   - `Part2_Case1/Makefile`
-- **Dependencies:** Phase 2 multi-threaded server.
 - **Acceptance Criteria:**
   - Server executes `./server <port> <topics_root> <failure_prob> [--seed S]`.
   - With $p > 0$, connections drop mid-transfer; client reconnects from File 0, Offset 0.
@@ -79,37 +76,35 @@ graph TD
 
 ---
 
-## Phase 4: Part II Case 2 — Session Management & ACK Commitment
+## Phase 4: Part II Case 2 — Session Management & Checkpoint Commitment
 
-- **Objective:** Implement dynamic server session table, client checkpoint disk persistence (`.session_<topic>.chk`), explicit `MSG_ACK` commitment loop, and zero-redundancy resume.
+- **Objective:** Implement dynamic server session table, client checkpoint disk persistence (`.session_<topic>.chk`), explicit `MSG_ACK` commitment loop, and checkpoint-based minimized redundancy.
 - **Modules & Files:**
   - `src/server/session_mgr.h / .c`
   - `src/client/checkpoint.h / .c`
   - `Part2_Case2/server.c`
   - `Part2_Case2/client.c`
   - `Part2_Case2/Makefile`
-- **Dependencies:** Phase 3 fault injection framework.
 - **Acceptance Criteria:**
-  - Client sends `MSG_ACK` after local file write and checkpoint update.
-  - Server commits offset upon receiving `MSG_ACK`.
-  - Reconnect resumes strictly from last committed ACK offset $O_{last\_ack}$.
-  - Redundant payload bytes after committed ACK offset is **0 bytes**.
+  - A byte is committed ONLY after client receives, writes to disk, updates checkpoint, sends `MSG_ACK`, and server processes ACK.
+  - Retransmitted file payload bytes after un-ACKed failures are counted as $B_{redundant}$.
+  - Bytes BEFORE last committed ACK offset are NEVER retransmitted.
 
 ---
 
 ## Phase 5: Case 2 Enhanced — Multi-Stream Parallel Transfer
 
-- **Objective:** Implement non-blocking `epoll`/`select` parallel range-streaming client architecture to improve performance over lossy connections.
+- **Objective:** Implement non-blocking `epoll`/`select` parallel range-streaming client architecture to evaluate performance over lossy connections.
 - **Modules & Files:**
   - `src/client/range_stream.h / .c`
   - `Part2_Case2_Enhanced/server.c`
   - `Part2_Case2_Enhanced/client.c`
   - `Part2_Case2_Enhanced/Makefile`
-- **Dependencies:** Phase 4 Case 2 checkpoint architecture.
 - **Acceptance Criteria:**
-  - Client spawns $K$ parallel TCP connections issuing ranged chunk requests.
-  - Parallel streams handle lossy interruptions independently.
-  - Empirically measures completion time and throughput, logging metrics for report comparison against standard Case 2.
+  - Client spawns $K$ parallel TCP connections issuing disjoint ranged chunk requests.
+  - Atomic range queue prevents overlapping assignments; failed stream ranges are returned to queue.
+  - Range maps track completion; checkpoint commits contiguous completed offsets across streams.
+  - Empirically measures completion time, throughput, and overhead, logging metrics for report comparison against standard Case 2.
 
 ---
 
