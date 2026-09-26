@@ -23,12 +23,19 @@ void log_msg(log_level_t level, const char *fmt, ...);
 /* Monotonic Clock Time Helper (Seconds) */
 double get_time_seconds(void);
 
-/* Safe Path Joining Utility */
+/* Path Safety & Joining Utilities */
+bool is_safe_relative_path(const char *path);
 int join_paths(char *out, size_t out_len, const char *base, const char *sub);
 
-/* String Numeric Parsers */
+/* Strict String Numeric Parsers */
 bool parse_uint16(const char *str, uint16_t *out);
 bool parse_uint32(const char *str, uint32_t *out);
+
+/*
+ * Generic string-to-float parser.
+ * Range validation (0.0 <= failure_probability <= 1.0) is the explicit
+ * responsibility of higher-level CLI option validation in Part II.
+ */
 bool parse_float(const char *str, float *out);
 
 #endif /* UTILS_H */

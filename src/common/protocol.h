@@ -21,12 +21,16 @@
 #define FLAG_FINAL_DONE       0x04U
 #define FLAG_ERR              0x08U
 
+#define VALID_FLAGS_MASK      (FLAG_RESUME | FLAG_EOF_FILE | FLAG_FINAL_DONE | FLAG_ERR)
+
 /* Error Codes */
 #define ERR_OK                0x0000U
 #define ERR_PATH_TOO_LONG     0x0400U
 #define ERR_BAD_MAGIC         0x0401U
 #define ERR_BAD_PAYLOAD_LEN   0x0402U
+#define ERR_BAD_MSG_TYPE      0x0403U
 #define ERR_TOPIC_NOT_FOUND   0x0404U
+#define ERR_BAD_FLAGS         0x0405U
 #define ERR_INVALID_SESSION   0x0409U
 #define ERR_INTERNAL_SERVER   0x0500U
 #define ERR_SERVER_FULL       0x0503U
@@ -56,10 +60,6 @@ typedef struct {
     uint32_t payload_len;
     uint32_t seq_num;
 } header_t;
-
-/* 64-bit Network Byte Order Helpers */
-uint64_t htonll_val(uint64_t val);
-uint64_t ntohll_val(uint64_t val);
 
 /* Header Serialization & Deserialization */
 void serialize_header(const header_t *hdr, uint8_t *buf);

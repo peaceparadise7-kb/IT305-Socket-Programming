@@ -1,4 +1,5 @@
 #include "utils.h"
+#include "protocol.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -51,24 +52,66 @@ double get_time_seconds(void) {
     return 0.0;
 }
 
+bool is_safe_relative_path(const char *path) {
+    if (path == NULL || *path == '\0') {
+        return false;
+    }
+
+    size_t len = strlen(path);
+    if (len > MAX_PATH_LEN) {
+        return false;
+    }
+
+    /* Reject absolute paths */
+    if (path[0] == '/') {
+        return false;
+    }
+
+    const char *ptr = path;
+    while (*ptr != '\0') {
+        /* Reject empty component created by repeated slashes (e.g. "a//b") */
+        if (ptr[0] == '/' && ptr[1] == '/') {
+            return false;
+        }
+
+        const char *seg_start = (*ptr == '/') ? ptr + 1 : ptr;
+        if (*seg_start == '\0') {
+            /* Trailing slash e.g. "dir/" */
+            return false;
+        }
+
+        const char *seg_end = seg_start;
+        while (*seg_end != '\0' && *seg_end != '/') {
+            seg_end++;
+        }
+        size_t seg_len = (size_t)(seg_end - seg_start);
+
+        /* Component-based checks */
+        if (seg_len == 1 && seg_start[0] == '.') {
+            return false; /* "." component */
+        }
+        if (seg_len == 2 && seg_start[0] == '.' && seg_start[1] == '.') {
+            return false; /* ".." component */
+        }
+
+        ptr = seg_end;
+    }
+
+    return true;
+}
+
 int join_paths(char *out, size_t out_len, const char *base, const char *sub) {
     if (out == NULL || out_len == 0 || base == NULL || sub == NULL) {
+        return -1;
+    }
+    if (!is_safe_relative_path(sub)) {
         return -1;
     }
 
     size_t base_len = strlen(base);
     bool base_has_slash = (base_len > 0 && base[base_len - 1] == '/');
-    bool sub_has_slash = (sub[0] == '/');
 
-    int written;
-    if (base_has_slash && sub_has_slash) {
-        written = snprintf(out, out_len, "%s%s", base, sub + 1);
-    } else if (!base_has_slash && !sub_has_slash) {
-        written = snprintf(out, out_len, "%s/%s", base, sub);
-    } else {
-        written = snprintf(out, out_len, "%s%s", base, sub);
-    }
-
+    int written = snprintf(out, out_len, base_has_slash ? "%s%s" : "%s/%s", base, sub);
     if (written < 0 || (size_t)written >= out_len) {
         return -1;
     }
@@ -78,6 +121,11 @@ int join_paths(char *out, size_t out_len, const char *base, const char *sub) {
 bool parse_uint16(const char *str, uint16_t *out) {
     if (str == NULL || out == NULL || *str == '\0') {
         return false;
+    }
+    for (size_t i = 0; str[i] != '\0'; i++) {
+        if (str[i] < '0' || str[i] > '9') {
+            return false;
+        }
     }
     char *endptr = NULL;
     errno = 0;
@@ -92,6 +140,11 @@ bool parse_uint16(const char *str, uint16_t *out) {
 bool parse_uint32(const char *str, uint32_t *out) {
     if (str == NULL || out == NULL || *str == '\0') {
         return false;
+    }
+    for (size_t i = 0; str[i] != '\0'; i++) {
+        if (str[i] < '0' || str[i] > '9') {
+            return false;
+        }
     }
     char *endptr = NULL;
     errno = 0;

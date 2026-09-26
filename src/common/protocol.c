@@ -2,16 +2,6 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <errno.h>
-#include <arpa/inet.h>
-
-uint64_t htonll_val(uint64_t val) {
-    return (((uint64_t)htonl((uint32_t)(val >> 32))) |
-            (((uint64_t)htonl((uint32_t)(val & 0xFFFFFFFFULL))) << 32));
-}
-
-uint64_t ntohll_val(uint64_t val) {
-    return htonll_val(val);
-}
 
 void serialize_uint16(uint16_t val, uint8_t *buf) {
     buf[0] = (uint8_t)((val >> 8) & 0xFFU);
@@ -81,6 +71,9 @@ int validate_header(const header_t *hdr) {
     if (hdr->payload_len > MAX_PAYLOAD_LEN) {
         return (int)ERR_BAD_PAYLOAD_LEN;
     }
+    if ((hdr->flags & ~VALID_FLAGS_MASK) != 0U) {
+        return (int)ERR_BAD_FLAGS;
+    }
     switch (hdr->msg_type) {
         case MSG_GET_REQ:
         case MSG_MANIFEST_START:
@@ -94,7 +87,7 @@ int validate_header(const header_t *hdr) {
         case MSG_MANIFEST_END:
             break;
         default:
-            return (int)ERR_BAD_MAGIC;
+            return (int)ERR_BAD_MSG_TYPE;
     }
     return (int)ERR_OK;
 }
