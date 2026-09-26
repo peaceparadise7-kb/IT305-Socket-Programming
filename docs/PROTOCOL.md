@@ -120,9 +120,15 @@ TCP provides a continuous byte stream without application-level frame boundaries
 ### 4.6 `MSG_TRANSFER_DONE` (0x06) & `MSG_ERROR` (0x07)
 - `MSG_TRANSFER_DONE` carries `Session ID` (33B) and `Total Payload Bytes Sent` (uint64_t).
 - `MSG_ERROR` carries `Error Code` (uint16_t) and `Error Message` string:
-  - `0x0400`: Protocol Error / Path Too Long ($> 4096$ bytes).
-  - `0x0404`: Topic Directory Not Found.
-  - `0x0503`: Server Session Table Full.
+  - `0x0400`: Protocol Error / Path Too Long ($> 4096$ bytes)
+  - `0x0401`: Bad Magic Bytes
+  - `0x0402`: Bad Payload Length ($> 65536$ bytes)
+  - `0x0403`: Bad Message Type
+  - `0x0404`: Topic Directory Not Found
+  - `0x0405`: Bad / Reserved Flags
+  - `0x0409`: Invalid Session ID
+  - `0x0500`: Internal Server Error
+  - `0x0503`: Server Session Table Full
 
 ---
 
