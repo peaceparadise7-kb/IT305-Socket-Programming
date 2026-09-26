@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -22,6 +23,13 @@ static int g_tests_passed = 0;
         printf("FAIL\n"); \
     } \
 } while (0)
+
+static void sleep_ms(int ms) {
+    struct timespec req;
+    req.tv_sec = ms / 1000;
+    req.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&req, NULL);
+}
 
 /* 1. Header Serialization / Deserialization */
 static bool test_header_serialization(void) {
@@ -98,41 +106,89 @@ static bool test_uint64_offset_serialization(void) {
     return (decoded == original);
 }
 
-/* 6. read_n() with Fragmented Input using socketpair() */
+/* 6. read_n() with Fragmented Input using Socketpair and Writer Thread */
+typedef struct {
+    int fd;
+} read_frag_args_t;
+
+static void *read_frag_writer(void *arg) {
+    read_frag_args_t *args = (read_frag_args_t *)arg;
+    int fd = args->fd;
+    const char *p1 = "Part1_";
+    const char *p2 = "Part2_";
+    const char *p3 = "Part3_End";
+
+    /* Write Part 1 */
+    if (write(fd, p1, strlen(p1)) <= 0) return NULL;
+    sleep_ms(5); /* 5ms delay ensures reader's recv() consumes p1 and blocks for p2 */
+
+    /* Write Part 2 */
+    if (write(fd, p2, strlen(p2)) <= 0) return NULL;
+    sleep_ms(5); /* 5ms delay ensures reader's recv() consumes p2 and blocks for p3 */
+
+    /* Write Part 3 */
+    if (write(fd, p3, strlen(p3)) <= 0) return NULL;
+
+    return NULL;
+}
+
 static bool test_read_n_fragmented(void) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
         return false;
     }
 
-    const char *p1 = "Part1_";
-    const char *p2 = "Part2_";
-    const char *p3 = "Part3_End";
+    read_frag_args_t args = { .fd = sv[1] };
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, read_frag_writer, &args) != 0) {
+        close(sv[0]);
+        close(sv[1]);
+        return false;
+    }
+
+    const char *expected = "Part1_Part2_Part3_End";
+    size_t total_len = strlen(expected);
     char buf[64];
     memset(buf, 0, sizeof(buf));
 
-    ssize_t w1 = write(sv[1], p1, strlen(p1));
-    ssize_t w2 = write(sv[1], p2, strlen(p2));
-    ssize_t w3 = write(sv[1], p3, strlen(p3));
-    (void)w1; (void)w2; (void)w3;
-
-    size_t total_len = strlen(p1) + strlen(p2) + strlen(p3);
+    /* Main thread calls read_n() requesting full length while writer sends fragments with micro-delays */
     ssize_t nread = read_n(sv[0], buf, total_len);
 
+    pthread_join(thread, NULL);
     close(sv[0]);
     close(sv[1]);
 
-    return (nread == (ssize_t)total_len && strcmp(buf, "Part1_Part2_Part3_End") == 0);
+    return (nread == (ssize_t)total_len && strcmp(buf, expected) == 0);
 }
 
-/* 7. write_n() with Controlled Payload */
+/* 7. write_n() under Controlled Partial Send & Socket Backpressure */
+typedef struct {
+    int fd;
+    size_t payload_size;
+    const uint8_t *tx_buf;
+    ssize_t nwritten;
+} write_n_args_t;
+
+static void *write_n_sender_thread(void *arg) {
+    write_n_args_t *wargs = (write_n_args_t *)arg;
+    wargs->nwritten = write_n(wargs->fd, wargs->tx_buf, wargs->payload_size);
+    return NULL;
+}
+
 static bool test_write_n(void) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
         return false;
     }
 
-    size_t payload_size = 32768;
+    /* Configure small socket send & receive buffer limits to force backpressure */
+    int sndbuf = 4096;
+    int rcvbuf = 4096;
+    setsockopt(sv[1], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    setsockopt(sv[0], SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+    /* 128 KiB payload (32x larger than 4 KiB socket buffer) */
+    size_t payload_size = 131072;
     uint8_t *tx_buf = malloc(payload_size);
     uint8_t *rx_buf = malloc(payload_size);
     if (!tx_buf || !rx_buf) {
@@ -147,10 +203,42 @@ static bool test_write_n(void) {
         tx_buf[i] = (uint8_t)(i & 0xFFU);
     }
 
-    ssize_t nwritten = write_n(sv[1], tx_buf, payload_size);
-    ssize_t nread = read_n(sv[0], rx_buf, payload_size);
+    write_n_args_t wargs = {
+        .fd = sv[1],
+        .payload_size = payload_size,
+        .tx_buf = tx_buf,
+        .nwritten = -1
+    };
 
-    bool ok = (nwritten == (ssize_t)payload_size && nread == (ssize_t)payload_size &&
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, write_n_sender_thread, &wargs) != 0) {
+        free(tx_buf);
+        free(rx_buf);
+        close(sv[0]);
+        close(sv[1]);
+        return false;
+    }
+
+    /* Main thread consumes data in small 2 KiB chunks with micro-delays to generate continuous backpressure */
+    size_t total_received = 0;
+    while (total_received < payload_size) {
+        size_t chunk_to_read = 2048;
+        if (payload_size - total_received < chunk_to_read) {
+            chunk_to_read = payload_size - total_received;
+        }
+
+        ssize_t nread = read_n(sv[0], rx_buf + total_received, chunk_to_read);
+        if (nread <= 0) {
+            break;
+        }
+        total_received += (size_t)nread;
+        sleep_ms(1); /* 1ms micro-delay maintains socket backpressure on sender */
+    }
+
+    pthread_join(thread, NULL);
+
+    bool ok = (wargs.nwritten == (ssize_t)payload_size &&
+               total_received == payload_size &&
                memcmp(tx_buf, rx_buf, payload_size) == 0);
 
     free(tx_buf);
