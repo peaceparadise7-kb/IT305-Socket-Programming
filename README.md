@@ -15,9 +15,9 @@ The project is structured into two primary parts:
 2. **Part II — Fault-Tolerant File Transfer:** Introduces probabilistic network connection drops ($p \in [0.0, 1.0]$) during active streaming to evaluate recovery mechanisms across three variants:
    - **Case 1 (Full Restart):** Connection failures interrupt active transfers; client reconnects and restarts streaming from File 0, Byte Offset 0, causing measurable **redundant retransmissions**.
    - **Case 2 (Session Management & Checkpoint Commitment):** Implements client disk checkpointing (`.session_<topic>.chk`) and server session tracking. Data is committed strictly after client disk write and explicit `MSG_ACK` receipt. Reconnection resumes from the last committed ACK offset, enforcing **checkpoint-based minimized redundancy**.
-   - **Case 2 Enhanced (Multi-Stream Non-Blocking Range Streaming):** Multiplexes $K$ parallel TCP connection streams using non-blocking I/O (`epoll`/`select`), distributing disjoint byte range requests to isolate connection losses per range and maximize TCP throughput over lossy links.
+   - **Case 2 Enhanced (Multi-Stream Non-Blocking Range Streaming):** Multiplexes $K$ parallel TCP connection streams using non-blocking I/O (`epoll`/`select`), distributing disjoint byte range requests to isolate connection losses per range and evaluate whether parallel streams improve throughput over lossy links.
 
-All system variations undergo empirical performance benchmarks measuring aggregate throughput, wall-clock completion time, useful payload bytes, redundant retransmitted bytes, and protocol overhead.
+All system variations will undergo empirical performance benchmarks measuring aggregate throughput, wall-clock completion time, useful payload bytes, redundant retransmitted bytes, and protocol overhead.
 
 ---
 
@@ -56,7 +56,7 @@ graph TD
     subgraph Server Node
         Listener[TCP Port Listener]
         Dispatcher{Concurrency Mode}
-        Worker[Worker Thread Pool]
+        Worker[Per-Connection Worker Thread]
         TopicMgr[Topic Directory Scanner]
         FaultEngine[Bernoulli Fault Injector]
         SessionTable[(Dynamic Session Hash Table)]
@@ -84,9 +84,9 @@ graph TD
 
 | Component Module | File Location | Status | Primary Responsibility |
 | :--- | :--- | :--- | :--- |
-| **Protocol Library** | [src/common/protocol.h](file:///c:/Users/Kavya.ASCENSIONX/Desktop/IT305-Socket-Programming/src/common/protocol.h), [.c](file:///c:/Users/Kavya.ASCENSIONX/Desktop/IT305-Socket-Programming/src/common/protocol.c) | **Complete** | 12-byte header serialization, scalar field packing, frame validation, and `read_n()` / `write_n()` TCP I/O helpers. |
-| **Checksum Module** | [src/common/checksum.h](file:///c:/Users/Kavya.ASCENSIONX/Desktop/IT305-Socket-Programming/src/common/checksum.h), [.c](file:///c:/Users/Kavya.ASCENSIONX/Desktop/IT305-Socket-Programming/src/common/checksum.c) | **Complete** | Lock-free, thread-safe IEEE 802.3 CRC32 calculation (`0xEDB88320`) for local checkpoint file integrity. |
-| **Utilities Module** | [src/common/utils.h](file:///c:/Users/Kavya.ASCENSIONX/Desktop/IT305-Socket-Programming/src/common/utils.h), [.c](file:///c:/Users/Kavya.ASCENSIONX/Desktop/IT305-Socket-Programming/src/common/utils.c) | **Complete** | Formatted level logging, `CLOCK_MONOTONIC` timing, strict unsigned decimal parsing, and untrusted path traversal validation (`is_safe_relative_path`). |
+| **Protocol Library** | [src/common/protocol.h](src/common/protocol.h), [.c](src/common/protocol.c) | **Complete** | 12-byte header serialization, scalar field packing, frame validation, and `read_n()` / `write_n()` TCP I/O helpers. |
+| **Checksum Module** | [src/common/checksum.h](src/common/checksum.h), [.c](src/common/checksum.c) | **Complete** | Lock-free, thread-safe IEEE 802.3 CRC32 calculation (`0xEDB88320`) for local checkpoint file integrity. |
+| **Utilities Module** | [src/common/utils.h](src/common/utils.h), [.c](src/common/utils.c) | **Complete** | Formatted level logging, `CLOCK_MONOTONIC` timing, strict unsigned decimal parsing, and untrusted path traversal validation (`is_safe_relative_path`). |
 | **Topic Manager** | `src/server/topic_mgr.h`, `.c` | *Planned (Phase 1)* | Directory traversal, file manifest construction, and relative path safety verification. |
 | **Server Core** | `src/server/server_core.h`, `.c` | *Planned (Phase 1/2)* | TCP socket listening, connection dispatcher, and pthread worker management. |
 | **Fault Injector** | `src/server/fault_inject.h`, `.c` | *Planned (Phase 3)* | Thread-safe per-chunk Bernoulli fault generator (`rand_r(&seed)`). |
@@ -241,7 +241,7 @@ The wire protocol framing standard defined in [docs/PROTOCOL.md](docs/PROTOCOL.m
 
 ## Repository Structure
 
-The current directory structure reflects the Phase 0 baseline implementation, with planned submission directories structured per course requirements:
+### Current Repository Structure (Phase 0 Complete)
 
 ```text
 IT305-Socket-Programming/
@@ -264,31 +264,37 @@ IT305-Socket-Programming/
 │       ├── protocol.h          # Framing constants, header_t, msg_type_t
 │       ├── utils.c             # Formatted logging, CLOCK_MONOTONIC & path safety
 │       └── utils.h             # Logging macros, is_safe_relative_path prototype
-├── tests/                      # Core Unit Test Suite
-│   ├── Makefile                # Test harness build script (-std=c99 -Werror)
-│   └── test_phase0.c           # 17 comprehensive unit tests & TSAN validation
-├── Part1/                      # [Planned Phase 1/2] Part I Standalone Build
+└── tests/                      # Core Unit Test Suite
+    ├── Makefile                # Test harness build script (-std=c99 -Werror)
+    └── test_phase0.c           # 17 comprehensive unit tests
+```
+
+### Planned Submission Directory Structure (Phases 1–7)
+
+```text
+IT305-Socket-Programming/
+├── Part1/                      # Part I Standalone Build (server, client)
 │   ├── Makefile                # Target: server, client
 │   ├── server.c
 │   └── client.c
-├── Part2_Case1/                # [Planned Phase 3] Part II Case 1 Standalone Build
+├── Part2_Case1/                # Part II Case 1 Standalone Build (server, client)
 │   ├── Makefile                # Target: server, client
 │   ├── server.c
 │   └── client.c
-├── Part2_Case2/                # [Planned Phase 4] Part II Case 2 Standalone Build
+├── Part2_Case2/                # Part II Case 2 Standalone Build (server, client)
 │   ├── Makefile                # Target: server, client
 │   ├── server.c
 │   └── client.c
-├── Part2_Case2_Enhanced/       # [Planned Phase 5] Case 2 Enhanced Standalone Build
+├── Part2_Case2_Enhanced/       # Case 2 Enhanced Standalone Build (server, client)
 │   ├── Makefile                # Target: server, client
 │   ├── server.c
 │   └── client.c
-├── Results/                    # [Planned Phase 6] Experiment Logs & Plots
+├── Results/                    # Benchmark CSV logs & generated PNG graphs
 │   ├── raw_data/               # Benchmark CSV logs
 │   └── plots/                  # Generated performance PNG graphs
-└── scripts/                    # [Planned Phase 6] Automation & Plotting Scripts
+└── scripts/                    # Automation & Plotting Scripts
     ├── run_experiments.sh      # Automated multi-client test harness
-    └── plot_results.py         # Matplotlib/Seaborn graph generator
+    └── plot_results.py         # Matplotlib performance graph generator
 ```
 
 ---
@@ -299,13 +305,13 @@ The project follows an 8-phase implementation roadmap defined in [docs/IMPLEMENT
 
 | Phase | Description | Key Deliverables / Focus | Status |
 | :---: | :--- | :--- | :---: |
-| **Phase 0** | **Core Infrastructure & Protocol** | 12-byte header packing, `read_n`/`write_n`, CRC32, `is_safe_relative_path`, 17 unit tests, TSAN clean. | **COMPLETE** |
+| **Phase 0** | **Core Infrastructure & Protocol** | 12-byte header packing, `read_n`/`write_n`, CRC32, `is_safe_relative_path`, 17 unit tests. | **COMPLETE** |
 | **Phase 1** | **Part I Single-Threaded Server & Client** | Sequential topic discovery, multi-frame manifest, synchronous single-client file streaming. | *PLANNED* |
 | **Phase 2** | **Part I Multi-Threaded Server** | Pthread worker per client connection (`pthread_create`), concurrent transfer validation. | *PLANNED* |
 | **Phase 3** | **Part II Case 1 Fault Injection** | Per-chunk Bernoulli fault generator (`--seed`), un-sessioned full restart, retransmission logging. | *PLANNED* |
 | **Phase 4** | **Part II Case 2 Checkpoint Commitment** | Dynamic server session hash table, local disk checkpointing (`.session.chk`), explicit ACK commitment loop. | *PLANNED* |
 | **Phase 5** | **Case 2 Enhanced Parallel Streaming** | $K$ parallel TCP streams, non-blocking `epoll`/`select` reactor, disjoint range work-queue. | *PLANNED* |
-| **Phase 6** | **Automated Experimentation** | Multi-computer test harness scripts, CSV logging schema, Matplotlib graph generation. | *PLANNED* |
+| **Phase 6** | **Automated Experimentation** | Multi-computer test harness scripts, CSV logging schema, Matplotlib performance graph generation. | *PLANNED* |
 | **Phase 7** | **Final Submission & Report** | Clean submission folder assembly (`Part1/`..`Part2_Case2_Enhanced/`), final report PDF assembly. | *PLANNED* |
 
 ---
@@ -399,14 +405,11 @@ The current test suite (`tests/test_phase0.c`) executes 17 automated unit tests 
 16. **Strict Unsigned Int Parsing:** Verifies `parse_uint16`/`parse_uint32` accept `"0"`, `"65535"`, `"4294967295"` while strictly rejecting `""`, `NULL`, `"-1"`, `"+1"`, `" 1"`, `"1 "`, `"\t1"`, `"12abc"`.
 17. **Path Length Boundary:** Verifies 4096-byte paths are accepted and 4097-byte paths are rejected.
 
-### ThreadSanitizer Race Detection
-Passed ThreadSanitizer data-race audit under GCC (`-fsanitize=thread`) with **0 data races detected**.
-
 ---
 
 ## Performance Evaluation
 
-The experimentation framework defined in [docs/EXPERIMENT_PLAN.md](docs/EXPERIMENT_PLAN.md) establishes a controlled benchmark methodology across 3 physical/virtual Linux nodes (1 Server Node, 2 Client Nodes).
+The experimentation framework defined in [docs/EXPERIMENT_PLAN.md](docs/EXPERIMENT_PLAN.md) defines a planned benchmark methodology across 3 physical/virtual Linux nodes (1 Server Node, 2 Client Nodes).
 
 ### Benchmark Matrix
 - **Concurrent Clients ($N$):** $N \in \{1, 2, 4, 8, 16, 32\}$
@@ -414,7 +417,7 @@ The experimentation framework defined in [docs/EXPERIMENT_PLAN.md](docs/EXPERIME
 - **Trial Repetitions:** $M = 5$ independent trials per parameter point (reporting mean and 95% confidence intervals).
 
 ### Precise Byte Accounting Framework
-All trials log network bytes per the strict byte conservation equation:
+All planned experimental trials will log network bytes per the strict byte conservation equation:
 
 $$B_{wire} = B_{useful} + B_{redundant} + B_{overhead}$$
 
@@ -451,11 +454,11 @@ Detailed technical specifications and architectural documentation are available 
 
 ## Development Workflow
 
-- **Branching Strategy:**
-  - `main`: Protected stable baseline.
+- **Intended Branching Strategy:**
+  - `main`: Intended stable release branch.
   - `design-foundation`: Approved specification baseline (v1.2.0).
   - `feature/ws1-protocol-core`: Active implementation branch for Phase 0 infrastructure.
-- **Merge Order:** Workstream feature branches are merged sequentially into `main` after automated build and unit test verification.
+- **Planned Merge Strategy:** Workstream feature branches are planned to be merged sequentially into `main` after automated build and unit test verification.
 - **Contract Stability:** Shared header contracts (`src/common/protocol.h`, `checksum.h`, `utils.h`) remain stable across all workstreams.
 
 ---
@@ -498,6 +501,6 @@ This repository represents the course project for **IT305 Socket Programming**. 
 
 ## Project Status
 
-- **Current Implementation Milestone:** **Phase 0 — Core Protocol & Infrastructure Complete** (17/17 Unit Tests Passing, TSAN Clean).
+- **Current Implementation Milestone:** **Phase 0 — Core Protocol & Infrastructure Complete** (17/17 Unit Tests Passing).
 - **Engineering Baseline:** v1.2.0 Approved Specification Baseline.
 - **Next Implementation Milestone:** **Phase 1 — Part I Single-Threaded Server & Client**.
