@@ -1,8 +1,8 @@
 # IT305 Implementation Plan
 ## Fault-Tolerant Topic-Based File Distribution System
 
-**Document Status:** Approved Master Implementation Roadmap  
-**Version:** 1.0.0  
+**Document Status:** Approved Master Implementation Roadmap (Refined)  
+**Version:** 1.1.0  
 **Phases:** 8 Sequential Implementation & Verification Phases
 
 ---
@@ -14,7 +14,7 @@ graph TD
     P0[Phase 0: Design & Core Infrastructure] --> P1[Phase 1: Part I Single-Threaded]
     P1 --> P2[Phase 2: Part I Multi-Threaded]
     P2 --> P3[Phase 3: Part II Case 1 - Fault Injection & Restart]
-    P3 --> P4[Phase 4: Part II Case 2 - Session & Checkpointing]
+    P3 --> P4[Phase 4: Part II Case 2 - Session & ACK Checkpointing]
     P4 --> P5[Phase 5: Part II Case 2 Enhanced - Multi-Stream]
     P5 --> P6[Phase 6: Experimentation & Data Collection]
     P6 --> P7[Phase 7: Integration, Verification & Final Submission]
@@ -22,69 +22,66 @@ graph TD
 
 ---
 
-## Phase 0: Repository & Engineering Foundation
+## Phase 0: Core Infrastructure & Protocol Library
 
-- **Objective:** Establish common protocol headers, socket helpers, dynamic path handling, logging, build system, and design documentation.
+- **Objective:** Implement 12-byte header serialization, sequence number management, explicit `uint64_t` payload offset serialization, multi-frame manifest structures, socket helper routines (`read_n`, `write_n`), and CRC32 checkpoint validation.
 - **Modules & Files:**
-  - `docs/PROJECT_SPEC.md`, `docs/ARCHITECTURE.md`, `docs/PROTOCOL.md`, `docs/IMPLEMENTATION_PLAN.md`, `docs/TEST_PLAN.md`, `docs/EXPERIMENT_PLAN.md`, `docs/INTEGRATION_PLAN.md`
-  - `AGENTS.md`
+  - `docs/*`, `AGENTS.md`
   - `src/common/protocol.h`, `src/common/protocol.c`
   - `src/common/utils.h`, `src/common/utils.c`
-- **Dependencies:** None.
-- **Acceptance Criteria:** Protocol structs compile cleanly under GCC (`-Wall -Wextra -std=c99`). Header serialization functions pass mock unit tests.
+  - `src/common/checksum.h`, `src/common/checksum.c`
+- **Acceptance Criteria:** Header serialization functions pass unit tests. Multi-frame manifest functions encode/decode correctly. Zero compiler warnings under GCC `-Wall -Wextra -Werror -pedantic`.
 
 ---
 
 ## Phase 1: Part I Single-Threaded Server & Client
 
-- **Objective:** Implement sequential topic directory scanning, manifest creation, and synchronous single-client TCP file distribution.
+- **Objective:** Implement sequential topic directory scanning, multi-frame manifest streaming, and synchronous single-client TCP file distribution.
 - **Modules & Files:**
   - `src/server/topic_mgr.h / .c`
   - `Part1/server.c`
   - `Part1/client.c`
   - `Part1/Makefile`
-- **Dependencies:** Phase 0 common protocol library.
-- **Tests & Acceptance Criteria:**
-  - `make` inside `Part1/` produces executables `./server` and `./client`.
-  - Client command `./client 127.0.0.1 <port> <topic> <out_dir>` successfully downloads all files in `<topic>` folder.
-  - Verification: `diff -r dataset/Animals10/<topic> <out_dir>/<topic>` returns zero differences.
-  - Server handles Client A to completion before accepting Client B.
+- **Dependencies:** Phase 0 core library.
+- **Acceptance Criteria:**
+  - `./server <port> <topics_root> --mode single` handles clients sequentially.
+  - Client command `./client <server_ip> <port> <topic> <out_dir>` successfully downloads topic files.
+  - `diff -r dataset/Animals10/<topic> <out_dir>/<topic>` returns zero differences.
 
 ---
 
 ## Phase 2: Part I Multi-Threaded Server
 
-- **Objective:** Extend server to handle multiple clients concurrently using pthreads.
+- **Objective:** Implement concurrent multi-threaded server handling using detached pthreads (`pthread_create`).
 - **Modules & Files:**
   - `src/server/server_core.h / .c`
-  - Update `Part1/server.c` (supports CLI flag or mode for single vs multi-threaded).
+  - Update `Part1/server.c` (defaults to multi-threaded execution).
 - **Dependencies:** Phase 1 topic manager & framing core.
-- **Tests & Acceptance Criteria:**
-  - 10 concurrent client downloads run simultaneously without blocking or corrupting files.
-  - No thread races or file descriptor leaks under `valgrind --leak-check=full`.
+- **Acceptance Criteria:**
+  - 10 concurrent clients execute transfers simultaneously without blocking or corrupted files.
+  - Passes Valgrind memory leak audit without unclosed sockets or leaks.
 
 ---
 
 ## Phase 3: Part II Case 1 — Fault Injection & Restart
 
-- **Objective:** Introduce command-line failure probability $p$ and un-sessioned restart behavior.
+- **Objective:** Introduce command-line failure probability $p \in [0.0, 1.0]$, per-chunk Bernoulli fault generator, seed support `--seed`, and un-sessioned restart behavior.
 - **Modules & Files:**
   - `src/server/fault_inject.h / .c`
   - `Part2_Case1/server.c`
   - `Part2_Case1/client.c`
   - `Part2_Case1/Makefile`
 - **Dependencies:** Phase 2 multi-threaded server.
-- **Tests & Acceptance Criteria:**
-  - Server accepts `./server <port> <topics_root> <failure_prob>`.
-  - With $p > 0$, active connections drop mid-transfer.
-  - Client detects drop, reconnects, and restarts from File 0, Offset 0.
-  - Total bytes transferred logged is strictly greater than useful bytes due to redundant retransmission.
+- **Acceptance Criteria:**
+  - Server executes `./server <port> <topics_root> <failure_prob> [--seed S]`.
+  - With $p > 0$, connections drop mid-transfer; client reconnects from File 0, Offset 0.
+  - Total wire bytes recorded strictly exceeds useful bytes due to redundant retransmissions.
 
 ---
 
-## Phase 4: Part II Case 2 — Session & Checkpoint Management
+## Phase 4: Part II Case 2 — Session Management & ACK Commitment
 
-- **Objective:** Implement server session state table and client disk checkpointing (`.session_<topic>.chk`) for zero-redundancy transfer resume.
+- **Objective:** Implement dynamic server session table, client checkpoint disk persistence (`.session_<topic>.chk`), explicit `MSG_ACK` commitment loop, and zero-redundancy resume.
 - **Modules & Files:**
   - `src/server/session_mgr.h / .c`
   - `src/client/checkpoint.h / .c`
@@ -92,52 +89,51 @@ graph TD
   - `Part2_Case2/client.c`
   - `Part2_Case2/Makefile`
 - **Dependencies:** Phase 3 fault injection framework.
-- **Tests & Acceptance Criteria:**
-  - Server tracks active sessions in memory.
-  - Upon reconnection after fault, client sends `Session ID` + resume offset.
-  - Server resumes transfer strictly from saved byte offset.
-  - Redundant payload bytes transferred is **0 bytes**.
+- **Acceptance Criteria:**
+  - Client sends `MSG_ACK` after local file write and checkpoint update.
+  - Server commits offset upon receiving `MSG_ACK`.
+  - Reconnect resumes strictly from last committed ACK offset $O_{last\_ack}$.
+  - Redundant payload bytes after committed ACK offset is **0 bytes**.
 
 ---
 
 ## Phase 5: Case 2 Enhanced — Multi-Stream Parallel Transfer
 
-- **Objective:** Implement non-blocking `epoll`/`select` range-streaming enhancement to boost throughput over lossy connections.
+- **Objective:** Implement non-blocking `epoll`/`select` parallel range-streaming client architecture to improve performance over lossy connections.
 - **Modules & Files:**
   - `src/client/range_stream.h / .c`
   - `Part2_Case2_Enhanced/server.c`
   - `Part2_Case2_Enhanced/client.c`
   - `Part2_Case2_Enhanced/Makefile`
 - **Dependencies:** Phase 4 Case 2 checkpoint architecture.
-- **Tests & Acceptance Criteria:**
-  - Client uses $K$ parallel TCP streams issuing byte range chunk requests.
-  - Measured aggregate throughput under $p = 0.10$ exceeds standard Case 2 by $> 30\%$.
+- **Acceptance Criteria:**
+  - Client spawns $K$ parallel TCP connections issuing ranged chunk requests.
+  - Parallel streams handle lossy interruptions independently.
+  - Empirically measures completion time and throughput, logging metrics for report comparison against standard Case 2.
 
 ---
 
 ## Phase 6: Automated Experiment Harness & Benchmark Suite
 
-- **Objective:** Build reproducible test harness scripts to automate multi-computer / multi-client benchmarks, generate CSVs, and plot graphs.
+- **Objective:** Build reproducible test harness scripts to automate multi-computer benchmarks, export CSVs, and generate performance graphs.
 - **Modules & Files:**
-  - `scripts/run_experiments.sh` or `scripts/benchmark.py`
+  - `scripts/run_experiments.sh`
   - `scripts/plot_results.py`
   - `Results/raw_data/*.csv`
   - `Results/plots/*.png`
-- **Dependencies:** Phases 1–5 executables.
-- **Tests & Acceptance Criteria:**
-  - Automated script executes matrix of trials ($N \in \{1, 2, 4, 8, 16, 32\}$ clients; $p \in \{0.0, 0.05, 0.1, 0.2, 0.5\}$).
-  - Generates publication-ready PNG graphs saved under `Results/plots/`.
+- **Acceptance Criteria:**
+  - Automated script executes benchmark matrix ($N \in \{1..32\}$ clients, $p \in \{0.0..0.5\}$).
+  - Produces publication-ready PNG graphs saved under `Results/plots/`.
 
 ---
 
 ## Phase 7: Final Integration, Code Cleanup & Final Report
 
-- **Objective:** Verify submission directory layout, build cleanliness, zero compiler warnings, and generate the final project report PDF.
+- **Objective:** Assemble submission directory layout, verify build cleanliness across all parts, and finalize project report PDF.
 - **Modules & Files:**
   - `FinalSubmission_Group_<XXX>_<YYY>/` assembly directory.
   - `FinalReport_Group_<XXX>_<YYY>.pdf`
   - `README.md`
-- **Dependencies:** All previous phases.
 - **Acceptance Criteria:**
   - `make` inside `Part1/`, `Part2_Case1/`, `Part2_Case2/`, `Part2_Case2_Enhanced/` produces clean `server` and `client` binaries.
-  - Project passes complete end-to-end automated verification suite.
+  - Clean end-to-end automated verification across all test cases.

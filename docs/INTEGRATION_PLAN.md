@@ -1,8 +1,8 @@
 # IT305 Six-Workstream Integration Plan
 ## Parallel Development Strategy & Collaborative Engineering Framework
 
-**Document Status:** Approved Integration Strategy  
-**Version:** 1.0.0  
+**Document Status:** Approved Integration Strategy (Refined)  
+**Version:** 1.1.0  
 **Team Structure:** 6 Logical Workstreams
 
 ---
@@ -16,7 +16,7 @@ graph TD
     WS1[Workstream 1: Architecture & Protocol Core] --> WS2[Workstream 2: Single-Threaded Server]
     WS1 --> WS3[Workstream 3: Client & Framing Protocol]
     WS2 & WS3 --> WS4[Workstream 4: Part II Case 1 Fault Injection]
-    WS4 --> WS5[Workstream 5: Part II Case 2 Session & Checkpoint]
+    WS4 --> WS5[Workstream 5: Part II Case 2 Session & ACK Checkpoint]
     WS5 --> WS6[Workstream 6: Case 2 Enhanced & Experimentation]
 ```
 
@@ -24,42 +24,36 @@ graph TD
 
 | Workstream | Primary Role & Responsibility | Core Deliverables / Files Owned |
 | :--- | :--- | :--- |
-| **Workstream 1** | System Architect & Integration Lead | `src/common/protocol.h/.c`, `docs/*`, `AGENTS.md`, Root Makefile, CI scripts |
-| **Workstream 2** | Part I Single-Threaded Server Engineer | `src/server/topic_mgr.h/.c`, `Part1/server.c` (sequential mode) |
-| **Workstream 3** | Part I Client & Protocol Framing Engineer | `src/client/client_core.h/.c`, `Part1/client.c` |
+| **Workstream 1** | System Architect & Protocol Lead | `src/common/protocol.h/.c`, `src/common/checksum.h/.c`, `docs/*`, `AGENTS.md` |
+| **Workstream 2** | Part I Server Concurrency Engineer | `src/server/topic_mgr.h/.c`, `src/server/server_core.h/.c`, `Part1/server.c` |
+| **Workstream 3** | Part I Client & Manifest Framing Engineer | `src/client/client_core.h/.c`, `Part1/client.c` |
 | **Workstream 4** | Part II Case 1 Fault Injection Engineer | `src/server/fault_inject.h/.c`, `Part2_Case1/server.c`, `Part2_Case1/client.c` |
-| **Workstream 5** | Part II Case 2 Session & Checkpoint Specialist | `src/server/session_mgr.h/.c`, `src/client/checkpoint.h/.c`, `Part2_Case2/*` |
+| **Workstream 5** | Part II Case 2 Session & ACK Specialist | `src/server/session_mgr.h/.c`, `src/client/checkpoint.h/.c`, `Part2_Case2/*` |
 | **Workstream 6** | Enhanced Streaming & Benchmarking Specialist | `src/client/range_stream.h/.c`, `Part2_Case2_Enhanced/*`, `scripts/*`, `Results/*` |
 
 ---
 
 ## 2. Shared Core Architecture & Header Contracts
 
-All six workstreams rely on common interfaces defined by Workstream 1. Unilateral changes to shared headers are prohibited.
+All six workstreams rely on common interfaces defined by Workstream 1:
 
-- `src/common/protocol.h`: Defines packet types, 12-byte binary header, bit flags, error codes, `read_n()`, `write_n()`.
+- `src/common/protocol.h`: Defines packet types (`MSG_MANIFEST_START`, `MSG_MANIFEST_ENTRY`, `MSG_MANIFEST_END`, `MSG_ACK`), 12-byte binary header with 32-bit sequence number, bit flags, error codes, `read_n()`, `write_n()`.
+- `src/common/checksum.h`: Lightweight CRC32 checkpoint validation functions.
 - `src/common/utils.h`: Dynamic path formatting, monotonic timing helpers, synchronized logging.
-- `src/server/topic_mgr.h`: Topic validation, directory scanner, file manifest building functions.
+- `src/server/session_mgr.h`: Thread-safe dynamic session hash table and explicit `MSG_ACK` commitment functions.
 
 ---
 
 ## 3. Branching & Git Integration Strategy
 
-- **Protected Main Branch:** `main` branch remains stable and always buildable.
+- **Protected Main Branch:** `main` branch remains stable and buildable.
 - **Feature Branches:**
   - `feature/ws1-protocol-core`
-  - `feature/ws2-single-threaded-server`
-  - `feature/ws3-client-protocol`
+  - `feature/ws2-server-concurrency`
+  - `feature/ws3-client-manifest`
   - `feature/ws4-fault-injection-case1`
-  - `feature/ws5-session-checkpoint-case2`
+  - `feature/ws5-session-ack-checkpoint-case2`
   - `feature/ws6-enhanced-streaming-benchmarks`
-
-### Merge Sequence
-1. **Merge 1 (Foundation):** `feature/ws1-protocol-core` merged into `main`.
-2. **Merge 2 (Part I Base):** `feature/ws2` and `feature/ws3` merged into `main`. Clean build of `Part1/` verified.
-3. **Merge 3 (Fault Injection):** `feature/ws4` merged into `main`. Verification of `Part2_Case1/`.
-4. **Merge 4 (Checkpointing):** `feature/ws5` merged into `main`. Verification of `Part2_Case2/`.
-5. **Merge 5 (Enhancement & Benchmark):** `feature/ws6` merged into `main`. Verification of `Part2_Case2_Enhanced/` and `Results/`.
 
 ---
 
@@ -73,7 +67,7 @@ CC = gcc
 CFLAGS = -Wall -Wextra -Werror -std=c99 -I../src/common -I../src/server -I../src/client -D_POSIX_C_SOURCE=200809L
 LDFLAGS = -pthread
 
-COMMON_SRCS = ../src/common/protocol.c ../src/common/utils.c
+COMMON_SRCS = ../src/common/protocol.c ../src/common/utils.c ../src/common/checksum.c
 SERVER_SRCS = server.c ../src/server/topic_mgr.c ../src/server/server_core.c $(COMMON_SRCS)
 CLIENT_SRCS = client.c ../src/client/client_core.c $(COMMON_SRCS)
 
@@ -88,5 +82,3 @@ client: $(CLIENT_SRCS)
 clean:
 	rm -f server client *.o
 ```
-
-This guarantees complete independence for each submission part while preventing duplicate code proliferation.

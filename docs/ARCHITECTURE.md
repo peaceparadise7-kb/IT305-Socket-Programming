@@ -1,8 +1,8 @@
 # IT305 Socket Programming Architecture Document
 ## Fault-Tolerant Topic-Based File Distribution System
 
-**Document Status:** Approved Engineering Architecture  
-**Version:** 1.0.0  
+**Document Status:** Approved Engineering Architecture (Refined)  
+**Version:** 1.1.0  
 **Target Architecture:** POSIX / C99 (Linux/UNIX Sockets & Pthreads)
 
 ---
@@ -14,219 +14,140 @@ The system consists of a **Topic-Based File Server** and a **File Distribution C
 ```mermaid
 graph TD
     Client[Client Executable] -->|1. GET Topic Request| Server[Server Executable]
-    Server -->|2. Topic Lookup & Manifest| Directory[Topics Root Dir /dataset/Animals10]
-    Directory -->|3. File List & Sizes| Server
-    Server -->|4. File Data Framing| Net((TCP Network Stream))
+    Server -->|2. Multi-Frame Manifest Stream| Directory[Topics Root Dir /dataset/Animals10]
+    Directory -->|3. File Metadata| Server
+    Server -->|4. Chunked Data Framing| Net((TCP Network Stream))
     Net -->|5. Binary Payload / Chunks| Client
-    Client -->|6. Assembly & Checkpointing| LocalFS[Local Output Directory]
+    Client -->|6. Disk Write & ACK Packet| LocalFS[Local Output Directory & Checkpoint]
+    Client -->|7. MSG_ACK| Server
+    Server -->|8. Commit Session Offset| SessionTable[Server Session Table]
 ```
 
 ---
 
-## 2. Server Architecture
+## 2. Server Concurrency & CLI Architecture
 
-The server handles topic lookups, manifest construction, file streaming, session tracking, and probabilistic fault injection.
+### 2.1 Concurrency Modes & CLI Specification
+- **Mandatory Signature:** `./server <port> <topics_root_dir> [failure_probability]`
+- **Default Mode:** Multi-Threaded (one pthread per client connection).
+- **Mode Flag:** `./server <port> <topics_root_dir> [--mode single|multi]`
+  - `single`: Process clients sequentially on the main thread.
+  - `multi`: Main listener thread executes `accept()` and spawns detached worker threads (`pthread_create`).
 
 ```mermaid
 graph LR
-    subgraph Server Runtime
-        Listener[TCP Listener Port] -->|accept()| Dispatcher[Connection Handler / Thread Pool]
-        Dispatcher -->|Worker Thread| SessionMgr[Session & Checkpoint Manager]
-        Dispatcher -->|Worker Thread| TopicMapper[Topic Directory Resolver]
-        Dispatcher -->|Worker Thread| FaultInjector[Probabilistic Fault Injector]
-        FaultInjector -->|p < drand48()| ChunkStreamer[Chunked File Sender]
-        FaultInjector -->|p >= drand48()| DropConn[Forceful Socket Close]
+    subgraph Server Concurrency Architecture
+        Listener[TCP Listener Port] -->|accept()| ModeSwitch{Mode Check}
+        ModeSwitch -->|--mode single| SeqLoop[Sequential Client Handler]
+        ModeSwitch -->|--mode multi / default| ThreadPool[Pthread Dispatcher]
+        ThreadPool -->|Worker Thread| ClientHandler[Client Session Worker]
     end
 ```
 
-### 2.1 Concurrency Models
-
-#### 1. Single-Threaded Server Model (Part I)
-- **Execution Loop:** Synchronous blocking event loop (`accept()` -> `handle_client()` -> `close()` -> repeat).
-- **Behavior:** Serves one client connection to completion before calling `accept()` for the next queued connection. Incoming client connection requests backlog in the kernel socket listen queue (`listen(listen_fd, SOMAXCONN)`).
-
-#### 2. Multi-Threaded Server Model (Part I & Part II)
-- **Execution Loop:** Main listener thread executes blocking `accept()`.
-- **Thread Delegation:** Upon new connection, main thread spawns a POSIX detached worker thread (`pthread_create` with `PTHREAD_CREATE_DETACHED`) passing the client socket file descriptor.
-- **Concurrency Control:** Shared global session state and performance counters are protected by POSIX mutexes (`pthread_mutex_t`).
-
----
-
-## 3. Client Architecture
-
-The client requests topics, receives streamed metadata and file chunks, writes files to local disk, updates checkpoint state, and handles automatic reconnection upon socket drops.
-
-```mermaid
-graph TD
-    subgraph Client State Machine
-        Init[Parse CLI & Check Local Checkpoint] --> Connect[Connect to Server IP:Port]
-        Connect --> SendReq[Send MSG_GET_REQ + Session ID]
-        SendReq --> RecvMeta[Receive MSG_MANIFEST_RES]
-        RecvMeta --> StreamLoop[Receive MSG_FILE_HEADER & MSG_DATA_CHUNK]
-        StreamLoop -->|Chunk Received| WriteDisk[Write to Disk & Update Checkpoint]
-        StreamLoop -->|EOF Signaled| Done[Transfer Complete]
-        StreamLoop -->|Socket Disconnect| HandleLoss[Handle Disconnection]
-        HandleLoss -->|Case 1: No Session| ResetLocal[Reset Progress & Reconnect]
-        HandleLoss -->|Case 2: Session Active| LoadCheck[Load Checkpoint & Reconnect with Resume Offset]
-        ResetLocal --> Connect
-        LoadCheck --> Connect
-    end
-```
-
----
-
-## 4. Key Server & Client Data Structures
-
-### 4.1 Topic Manifest Structure (`manifest_t`)
-Represents the files belonging to a requested topic directory.
+### 2.2 Dynamic Session Table Architecture
+To prevent arbitrary fixed array limitations, the server maintains a dynamic, thread-safe session table:
 
 ```c
-typedef struct {
-    char relative_path[256];
-    uint64_t file_size;
-} file_entry_t;
-
-typedef struct {
+typedef struct session_node {
+    char session_id[33];
     char topic_name[64];
-    uint32_t total_files;
-    uint64_t total_bytes;
-    file_entry_t *files;
-} manifest_t;
-```
-
-### 4.2 Server Session Record (`session_entry_t`)
-Tracks client progress in memory on the server for Case 2 checkpointing.
-
-```c
-typedef struct {
-    char session_id[33];         // 32-char hex string + null
-    char topic_name[64];
-    uint32_t current_file_index;
-    uint64_t current_file_offset;
-    uint64_t bytes_transferred;
+    uint32_t committed_file_index;
+    uint64_t committed_byte_offset;
+    uint64_t total_useful_bytes;
     time_t last_active_time;
-    int is_active;
-} session_entry_t;
+    struct session_node *next;
+} session_node_t;
 
 typedef struct {
-    session_entry_t sessions[1024];
-    pthread_mutex_t lock;
+    session_node_t *buckets[256];
+    uint32_t active_sessions_count;
+    uint32_t max_allowed_sessions; // Default 4096, configurable
+    pthread_mutex_t table_lock;
 } session_table_t;
 ```
 
-### 4.3 Client Checkpoint File Format (`.session_<topic>.chk`)
-Stored locally on disk by the client for Case 2 state recovery.
+---
 
-```c
-typedef struct {
-    char session_id[33];
-    char topic_name[64];
-    uint32_t last_file_index;
-    uint64_t last_byte_offset;
-    uint64_t useful_bytes_received;
-    uint32_t checksum_crc32;
-} client_checkpoint_t;
+## 3. Case 2 Explicit Checkpoint Commitment Architecture
+
+### 3.1 Checkpoint Commitment State Machine
+The system relies on an **explicit commit model** to maintain state consistency across network failures:
+
+1. **Client Payload Receive:** Client receives `MSG_DATA_CHUNK` from server.
+2. **Local Persistence:** Client writes chunk payload to disk (`write()`).
+3. **Local Checkpoint Update:** Client updates local state structure and writes to `.session_<topic>.chk`.
+4. **Acknowledgement Transmission:** Client sends `MSG_ACK` payload `(Session_ID, File_Index, Acked_Byte_Offset)`.
+5. **Server Commitment:** Server worker receives `MSG_ACK`, updates `session_table_t`, and marks the offset as *committed*.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client Disk & Memory
+    participant S as Server Worker
+    participant ST as Server Session Table
+    participant FI as Fault Injector Engine
+
+    S->>C: MSG_DATA_CHUNK (File #1, Offset=100KB, Len=64KB)
+    C->>C: 1. Write 64KB payload to disk
+    C->>C: 2. Update local .session.chk (File #1, Offset=164KB)
+    C->>S: 3. Send MSG_ACK (SessionID="S123", File=1, Offset=164KB)
+    S->>ST: 4. Lock & Update Session "S123" -> Committed Offset=164KB
+    
+    FI->>S: 5. Bernoulli Fault Injected (before write_n)
+    S--xC: Socket Abruptly Closed!
+
+    Note over C: Client detects disconnect (recv == 0)
+    Note over C: Client reconnects using last local state (SessionID="S123", File=1, Offset=164KB)
+    
+    C->>S: MSG_GET_REQ (SessionID="S123", Resume File=1, Offset=164KB)
+    S->>ST: Lookup Session "S123" -> Server Committed Offset is 164KB
+    S->>C: MSG_MANIFEST_START (Resume Approved at 164KB)
+    S->>C: MSG_FILE_HEADER (File #1, StartOffset=164KB)
+    S->>C: MSG_DATA_CHUNK (Stream resumes at 164KB)
 ```
+
+### 3.2 Pre-ACK Failure & Redundant Byte Semantics
+If a socket failure occurs after the client writes to disk but **before** the server processes `MSG_ACK`:
+- Server's committed offset remains $O_{last\_ack}$ (e.g. 100 KB).
+- Upon reconnection, server resumes streaming from $O_{last\_ack}$ (100 KB).
+- Client receives data starting at 100 KB, seeks local file descriptor back to 100 KB (`lseek(fd, 100000, SEEK_SET)`), and overwrites the un-ACKed bytes (100 KB–164 KB).
+- **Redundant Bytes Definition:** $B_{redundant}$ is defined strictly as payload bytes retransmitted *after* the last committed ACK offset due to un-ACKed interruptions.
 
 ---
 
-## 5. Session Management & Checkpoint Strategy
+## 4. Probabilistic Fault Injection Engine
+
+- **Decision Location:** The Bernoulli failure check takes place on the server **immediately before** calling `write_n()` for each data chunk.
+- **Thread Safety:** Each worker thread maintains an independent pseudo-random seed state (`rand_r(&thread_seed)` or `drand48_r()`).
+- **Seed Parameter:** Configured via `./server ... [--seed S]`. Defaults to time-based seed if omitted.
+- **Edge Behaviors:**
+  - $p = 0.0$: Fault injector disabled; 0% connection interruptions.
+  - $p = 1.0$: Connection drops on first data chunk attempt.
+  - **Client Abort Guard:** Client enforces `--max-retries N` (default 10) to prevent infinite non-progressing reconnect loops when $p=1.0$.
+
+---
+
+## 5. Multi-Frame Manifest Architecture
+
+For topic directories with large numbers of files, the server streams the manifest in bounded frames:
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant C as Client
     participant S as Server
-    participant FI as Fault Injector
 
-    C->>S: MSG_GET_REQ (Topic="dog", SessionID="")
-    S->>S: Generate SessionID="A1B2C3D4"
-    S->>C: MSG_MANIFEST_RES (SessionID="A1B2C3D4", Files=10)
-    
-    loop File Stream
-        S->>C: MSG_FILE_HEADER (File #1 "dog1.jpg", Size=5MB)
-        S->>C: MSG_DATA_CHUNK (Chunk 1..N)
-        C->>C: Write to disk & Update Checkpoint (File #1, Offset=2.5MB)
-        FI->>S: Trigger Connection Fault (Probability p)
-        S--xC: Socket Closed Abruptly!
+    C->>S: MSG_GET_REQ (Topic="Animals10")
+    S->>C: MSG_MANIFEST_START (Files=500, TotalBytes=100MB)
+    loop For each file 1..500
+        S->>C: MSG_MANIFEST_ENTRY (Index=i, Size=s_i, Path="dog/01.jpg")
     end
-
-    Note over C: Client detects disconnect (recv == 0)
-    Note over C: Case 2: Load Checkpoint (SessionID="A1B2C3D4", File #1, Offset=2.5MB)
-
-    C->>S: Reconnect & MSG_GET_REQ (Topic="dog", SessionID="A1B2C3D4", File=1, Offset=2.5MB)
-    S->>S: Lookup SessionID -> Resume File #1 at Seek Offset 2.5MB
-    S->>C: MSG_MANIFEST_RES (Resume OK)
-    S->>C: MSG_FILE_HEADER (File #1, StartOffset=2.5MB)
-    S->>C: MSG_DATA_CHUNK (Remaining 2.5MB)
-    C->>C: Complete File #1 & continue File #2..10
+    S->>C: MSG_MANIFEST_END (EntriesSent=500, Status=0x0200)
 ```
 
 ---
 
-## 6. Fault Injection Mechanism
+## 6. Checksum Architecture
 
-1. **CLI Parameter:** Server parses float `failure_probability` $p \in [0.0, 1.0]$.
-2. **Injection Point:** Inside the server chunk streaming loop (sending 64KB buffers):
-   ```c
-   float rand_val = (float)rand() / (float)RAND_MAX;
-   if (rand_val < failure_prob) {
-       log_warn("Fault injected! Force closing client fd %d", client_fd);
-       shutdown(client_fd, SHUT_RDWR);
-       close(client_fd);
-       return NULL; // Terminate worker thread mid-transfer
-   }
-   ```
-3. **Reproducibility:** A seed option (`--seed S`) can be passed for deterministic debugging during automated integration testing.
-
----
-
-## 7. Case 2 Enhanced Architecture: Multi-Stream Non-Blocking Range Transfers
-
-To improve performance over lossy socket environments:
-- **Client Architecture:** Uses a non-blocking reactor multiplexing $K$ parallel TCP connection sockets (`epoll` / `select`).
-- **Chunk Range Request Protocol:** Client requests byte ranges (e.g. Range 0–1MB on Stream 1, 1MB–2MB on Stream 2).
-- **Fault Resiliency:** When a fault breaks Stream 1, only the un-ACKed range chunk of Stream 1 is re-queued, allowing remaining active streams to continue downloading uninterrupted.
-
----
-
-## 8. Directory & Module Boundaries Architecture
-
-To meet submission requirements while maintaining modular reuse, code is organized into a clean core module library (`src/common`, `src/server`, `src/client`), linked or compiled cleanly into each `Part/` subdirectory.
-
-```
-IT305-Socket-Programming/
-├── docs/                      # Architectural & Protocol Specs
-├── src/                       # Common Shared C Source Code
-│   ├── common/                # Shared Protocol, Framing, Utilities
-│   │   ├── protocol.h / .c    # Framing, Packet Structs, Serialization
-│   │   ├── utils.h / .c       # Dynamic Paths, Timing, Logging
-│   │   └── checksum.h / .c    # Checkpoint CRC32 verification
-│   ├── server/                # Server Core Modules
-│   │   ├── server_core.h / .c # Socket Listener, Thread Pool, Worker
-│   │   ├── topic_mgr.h / .c   # Topic Directory Scanner & Manifest
-│   │   ├── session_mgr.h / .c # Case 2 Session Table
-│   │   └── fault_inject.h/.c # Probabilistic Fault Generator
-│   └── client/                # Client Core Modules
-│       ├── client_core.h / .c # Connection Loop, Disconnect Handler
-│       ├── checkpoint.h / .c  # Local Checkpoint IO (.session.chk)
-│       └── range_stream.h/.c # Enhanced Multi-Stream Manager
-├── Part1/                     # Part I Standalone Executable Build
-│   ├── server.c               # Invokes src/ build for Part 1
-│   ├── client.c
-│   └── Makefile
-├── Part2_Case1/               # Part II Case 1 Standalone Build
-│   ├── server.c
-│   ├── client.c
-│   └── Makefile
-├── Part2_Case2/               # Part II Case 2 Standalone Build
-│   ├── server.c
-│   ├── client.c
-│   └── Makefile
-├── Part2_Case2_Enhanced/      # Part II Case 2 Enhanced Build
-│   ├── server.c
-│   ├── client.c
-│   └── Makefile
-├── tests/                     # Test Suites & Harness
-└── scripts/                   # Automated Benchmark & Plotting Scripts
-```
+1. **Local Checkpoint Protection (CRC32):** The client checkpoint file `.session_<topic>.chk` contains a CRC32 header checksum to detect local disk corruption of checkpoint records.
+2. **File Integrity (SHA-256):** End-to-end payload verification is handled independently post-transfer by comparing source and downloaded directory SHA-256 hashes (`diff -r` or `sha256sum`).

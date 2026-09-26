@@ -1,20 +1,20 @@
 # IT305 Wire Protocol Specification
 ## Application Layer Framing Protocol for Topic-Based File Transfer
 
-**Document Status:** Approved Wire Protocol Standard  
-**Version:** 1.0.0  
-**Byte Order:** Network Byte Order (Big-Endian) for numeric headers
+**Document Status:** Approved Wire Protocol Standard (Refined)  
+**Version:** 1.1.0  
+**Byte Order:** Network Byte Order (Big-Endian) for all numeric binary fields
 
 ---
 
-## 1. Overview & TCP Byte-Stream Framing Rules
+## 1. TCP Byte-Stream Framing Rules
 
-TCP is a stream-oriented protocol without inherent message boundaries. A single call to `send()` by the server may be split across multiple `recv()` calls on the client, or multiple small `send()` calls may be coalesced into a single TCP segment.
-
-To prevent framing ambiguity, buffer corruption, and protocol desynchronization:
-1. **Fixed Header:** Every protocol message begins with a fixed **12-byte Application Header**.
-2. **Explicit Length Prefix:** The header explicitly specifies the 32-bit payload length following the header.
-3. **Strict Reader Loop (`read_n`):** Receivers MUST loop over `recv()` until exactly 12 bytes of header are read before decoding payload length $L$, and then loop until all $L$ bytes of payload are consumed.
+TCP provides a continuous byte stream without application-level frame boundaries. To prevent message boundary ambiguity, buffer corruption, and framing desynchronization:
+1. **Fixed Header:** Every message begins with a mandatory **12-byte Application Header**.
+2. **32-Bit Sequence Number:** The header contains an explicit 32-bit packet sequence number (`seq_num`).
+3. **Payload Length Prefix:** The header specifies payload length $L$ (0 to 65,536 bytes).
+4. **Payload Offsets:** All 64-bit file byte offsets (`uint64_t`) are explicitly serialized inside packet payloads.
+5. **Strict Reader Loop (`read_n`):** Receivers MUST loop over `recv()` until exactly 12 bytes of header are read before decoding payload length $L$, and then loop until all $L$ bytes of payload are consumed.
 
 ---
 
@@ -29,7 +29,7 @@ To prevent framing ambiguity, buffer corruption, and protocol desynchronization:
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                        Payload Length (4B)                    |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                      Sequence / Offset (4B)                   |
+|                     Sequence Number (4B)                      |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
@@ -37,11 +37,11 @@ To prevent framing ambiguity, buffer corruption, and protocol desynchronization:
 
 | Field Offset | Field Name | Type | Size | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| **0x00** | `magic_bytes` | uint16_t | 2 Bytes | Protocol identifier. Constant `0x4954` ('I', 'T'). Packets without magic are rejected immediately. |
-| **0x02** | `msg_type` | uint8_t | 1 Byte | Identifies message type (`enum MsgType`). |
-| **0x03** | `flags` | uint8_t | 1 Byte | Bit flags: `0x01` = RESUME_REQ, `0x02` = EOF_FILE, `0x04` = FINAL_TOPIC_DONE, `0x08` = ERR_FLAG. |
-| **0x04** | `payload_len` | uint32_t | 4 Bytes | Length of following binary payload payload in bytes (0 to 65536). Big-Endian (`htonl`). |
-| **0x08** | `seq_or_offset` | uint32_t | 4 Bytes | Chunk sequence number or low 32-bit block index for data packets. |
+| **0x00** | `magic_bytes` | uint16_t | 2 Bytes | Constant `0x4954` ('I', 'T'). Invalid magic results in immediate disconnect. |
+| **0x02** | `msg_type` | uint8_t | 1 Byte | Message identifier (`enum MsgType`). |
+| **0x03** | `flags` | uint8_t | 1 Byte | Bit flags: `0x01` = FLAG_RESUME, `0x02` = FLAG_EOF_FILE, `0x04` = FLAG_FINAL_DONE, `0x08` = FLAG_ERR. |
+| **0x04** | `payload_len` | uint32_t | 4 Bytes | Payload length in bytes (0 to 65,536). Big-Endian (`htonl`). |
+| **0x08** | `seq_num` | uint32_t | 4 Bytes | Monotonically increasing packet sequence number per session. |
 
 ---
 
@@ -49,144 +49,124 @@ To prevent framing ambiguity, buffer corruption, and protocol desynchronization:
 
 | Code | Symbol | Direction | Purpose |
 | :--- | :--- | :--- | :--- |
-| **0x01** | `MSG_GET_REQ` | Client -> Server | Request topic transfer (initial or resume). |
-| **0x02** | `MSG_MANIFEST_RES` | Server -> Client | Respond with session ID, total file count, total bytes. |
-| **0x03** | `MSG_FILE_HEADER` | Server -> Client | Signal start of a specific file in the topic. |
-| **0x04** | `MSG_DATA_CHUNK` | Server -> Client | Stream raw file payload data chunk. |
-| **0x05** | `MSG_ACK` | Client -> Server | Periodic byte offset receipt acknowledgement. |
-| **0x06** | `MSG_TRANSFER_DONE` | Server -> Client | Signal end of entire topic transfer. |
-| **0x07** | `MSG_ERROR` | Server -> Client | Report error (topic not found, invalid offset, etc.). |
-| **0x08** | `MSG_RANGE_REQ` | Client -> Server | Enhanced mode range request (Part II Enhanced). |
+| **0x01** | `MSG_GET_REQ` | Client -> Server | Request topic file transfer (new or resume). |
+| **0x02** | `MSG_MANIFEST_START` | Server -> Client | Begin manifest streaming (session ID, totals). |
+| **0x03** | `MSG_FILE_HEADER` | Server -> Client | Signal start of file in topic. |
+| **0x04** | `MSG_DATA_CHUNK` | Server -> Client | Stream raw file payload chunk. |
+| **0x05** | `MSG_ACK` | Client -> Server | Explicit checkpoint acknowledgement. |
+| **0x06** | `MSG_TRANSFER_DONE` | Server -> Client | Signal completion of entire topic transfer. |
+| **0x07** | `MSG_ERROR` | Server -> Client | Report error state. |
+| **0x08** | `MSG_RANGE_REQ` | Client -> Server | Enhanced mode parallel stream range request. |
+| **0x09** | `MSG_MANIFEST_ENTRY` | Server -> Client | Stream single file metadata entry in manifest. |
+| **0x0A** | `MSG_MANIFEST_END` | Server -> Client | Signal completion of manifest streaming. |
 
 ---
 
-## 4. Detailed Message Definitions
+## 4. Message Definitions & Payload Schemas
 
 ### 4.1 `MSG_GET_REQ` (0x01) — Client Topic Request
-
 - **Direction:** Client $\rightarrow$ Server
-- **Flags:** `0x00` (New Request) or `0x01` (Resume Request)
-- **Payload Structure:**
+- **Payload Layout:**
   ```
   +-----------------------------------+-----------------------------------+
   | Topic Name (Null-Term, 64 Bytes)  | Session ID (Null-Term, 33 Bytes)  |
   +-----------------------------------+-----------------------------------+
-  | Resume File Index (uint32, 4B)    | Resume Byte Offset (uint64, 8B)   |
+  | Resume File Index (uint32_t, 4B)  | Resume Byte Offset (uint64_t, 8B) |
   +-----------------------------------+-----------------------------------+
   ```
-- **Meaning:** Client requests files under `<topics_root_dir>/<Topic>`. If `Session ID` is non-empty and `RESUME` flag is set, server attempts session recovery from specified file index and byte offset.
-- **Expected Response:** `MSG_MANIFEST_RES` on success, `MSG_ERROR` on failure.
+- **Semantics:** If `FLAG_RESUME` is set and `Session ID` is valid, server resumes from `(Resume File Index, Resume Byte Offset)`.
 
 ---
 
-### 4.2 `MSG_MANIFEST_RES` (0x02) — Topic Manifest Response
+### 4.2 Multi-Frame Manifest Sequence (0x02, 0x09, 0x0A)
+To handle directories with arbitrary numbers of files without exceeding `payload_len <= 65536`:
 
-- **Direction:** Server $\rightarrow$ Client
-- **Payload Structure:**
+#### `MSG_MANIFEST_START` (0x02)
+- **Payload Layout:**
   ```
   +-----------------------------------+-----------------------------------+
-  | Status Code (uint16, 2B)          | Session ID (Null-Term, 33 Bytes)  |
+  | Status Code (uint16_t, 2B)        | Session ID (Null-Term, 33 Bytes)  |
   +-----------------------------------+-----------------------------------+
-  | Total Files Count (uint32, 4B)    | Aggregate Topic Bytes (uint64, 8B)|
+  | Total Files (uint32_t, 4B)        | Total Topic Bytes (uint64_t, 8B)  |
   +-----------------------------------+-----------------------------------+
-  | Repeated File Entries:                                                |
-  |   - File Index (uint32, 4B)                                           |
-  |   - File Size (uint64, 8B)                                            |
-  |   - Path String Length (uint16, 2B)                                   |
-  |   - Relative Path String (Var-len)                                    |
-  +-----------------------------------------------------------------------+
   ```
-- **Meaning:** Informs client of assigned `Session ID`, total file count, and list of files. Client uses this manifest to pre-allocate local directory structures.
+
+#### `MSG_MANIFEST_ENTRY` (0x09) — Repeated per file
+- **Payload Layout:**
+  ```
+  +-----------------------------------+-----------------------------------+
+  | File Index (uint32_t, 4B)         | File Size (uint64_t, 8B)          |
+  +-----------------------------------+-----------------------------------+
+  | Path String Length (uint16_t, 2B) | Relative Path String (Var-len)    |
+  +-----------------------------------+-----------------------------------+
+  ```
+
+#### `MSG_MANIFEST_END` (0x0A)
+- **Payload Layout:**
+  ```
+  +-----------------------------------+-----------------------------------+
+  | Total Entries Sent (uint32_t, 4B) | Final Manifest Status (uint16, 2B)|
+  +-----------------------------------+-----------------------------------+
+  ```
 
 ---
 
 ### 4.3 `MSG_FILE_HEADER` (0x03) — File Start Indicator
-
-- **Direction:** Server $\rightarrow$ Client
-- **Payload Structure:**
+- **Payload Layout:**
   ```
   +-----------------------------------+-----------------------------------+
-  | File Index (uint32, 4B)           | File Start Offset (uint64, 8B)    |
+  | File Index (uint32_t, 4B)         | Start Byte Offset (uint64_t, 8B)  |
   +-----------------------------------+-----------------------------------+
-  | Total File Size (uint64, 8B)      | Relative Path (Null-Term, Var)    |
+  | Total File Size (uint64_t, 8B)    | Relative Path (Null-Term String)  |
   +-----------------------------------+-----------------------------------+
   ```
-- **Meaning:** Sent prior to streaming a file's data chunks. Informs client of the file being sent and the initial offset (0 for new file, $>0$ for resumed file).
 
 ---
 
 ### 4.4 `MSG_DATA_CHUNK` (0x04) — Data Streaming
-
-- **Direction:** Server $\rightarrow$ Client
-- **Flags:** `0x02` set if this is the final chunk of the current file (`FLAG_EOF_FILE`).
-- **Payload:** Raw binary byte buffer (up to 64 KB per chunk).
-- **Meaning:** Carries content of the active file. Client writes payload directly to local disk at `current_file_offset`.
+- **Flags:** `0x02` (`FLAG_EOF_FILE`) set on final chunk of active file.
+- **Payload:** Raw binary file bytes (up to 64 KB per frame).
 
 ---
 
-### 4.5 `MSG_TRANSFER_DONE` (0x06) — Topic Transfer Complete
-
-- **Direction:** Server $\rightarrow$ Client
-- **Flags:** `0x04` (`FLAG_FINAL_TOPIC_DONE`)
-- **Payload Structure:**
+### 4.5 `MSG_ACK` (0x05) — Explicit Checkpoint Commitment ACK
+- **Direction:** Client $\rightarrow$ Server
+- **Payload Layout:**
   ```
   +-----------------------------------+-----------------------------------+
-  | Session ID (Null-Term, 33 Bytes)  | Total Payload Bytes Sent (uint64) |
+  | Session ID (Null-Term, 33 Bytes)  | File Index (uint32_t, 4B)         |
+  +-----------------------------------+-----------------------------------+
+  | Acked Byte Offset (uint64_t, 8B)  | CRC32 Checkpoint Checksum (4B)   |
   +-----------------------------------+-----------------------------------+
   ```
-- **Meaning:** Signals that all files in the topic have been fully transmitted. Client deletes local `.session_<topic>.chk` checkpoint file and exits cleanly.
+- **Semantics:** Client sends this packet ONLY AFTER writing chunk data to disk and updating local checkpoint. Server updates its session record upon receipt. Duplicate ACKs are idempotent.
 
 ---
 
-### 4.6 `MSG_ERROR` (0x07) — Error Signaling
-
-- **Direction:** Server $\rightarrow$ Client
-- **Payload Structure:**
-  ```
-  +-----------------------------------+-----------------------------------+
-  | Error Code (uint16, 2B)           | Error Message (Null-Term String)  |
-  +-----------------------------------+-----------------------------------+
-  ```
-- **Error Codes:**
-  - `0x0404`: Topic directory not found.
-  - `0x0400`: Malformed request header / invalid protocol magic.
-  - `0x0409`: Invalid Session ID / expired session state.
-  - `0x0500`: Internal server filesystem read error.
+### 4.6 `MSG_TRANSFER_DONE` (0x06) & `MSG_ERROR` (0x07)
+- `MSG_TRANSFER_DONE` carries `Session ID` (33B) and `Total Payload Bytes Sent` (uint64_t).
+- `MSG_ERROR` carries `Error Code` (uint16_t) and `Error Message` string (`0x0404`: Topic Not Found, `0x0400`: Bad Magic, `0x0503`: Session Table Full).
 
 ---
 
-## 5. Session Checkpointing & Framing State Machine
+## 5. Protocol State Machine & Failure Scenarios
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Unconnected
-    Unconnected --> SendingGetReq: Connect to Server
-    SendingGetReq --> ReadingManifest: Send MSG_GET_REQ
-    ReadingManifest --> ReceivingFileHeader: Read MSG_MANIFEST_RES
-    ReceivingFileHeader --> ReceivingChunks: Read MSG_FILE_HEADER
-    ReceivingChunks --> ReceivingChunks: Read MSG_DATA_CHUNK & Write Disk
-    ReceivingChunks --> ReceivingFileHeader: Chunk EOF & More Files Remain
-    ReceivingChunks --> Done: Chunk EOF & Last File Complete
+    [*] --> Idle
+    Idle --> ManifestStream: Send MSG_GET_REQ
+    ManifestStream --> FileTransfer: MSG_MANIFEST_END
+    FileTransfer --> SendingACK: Recv MSG_DATA_CHUNK & Write Disk
+    SendingACK --> FileTransfer: Send MSG_ACK to Server
+    FileTransfer --> Complete: Final File ACKed
     
-    ReceivingChunks --> ConnectionLost: Socket Error / Abrupt Disconnect
-    ConnectionLost --> Unconnected: Checkpoint Saved (.session.chk)
+    SendingACK --> Disconnected: Connection Interrupted
+    FileTransfer --> Disconnected: Connection Interrupted
+    Disconnected --> Idle: Reconnect with Last Committed ACK Offset
 ```
 
----
-
-## 6. Case 1 vs. Case 2 Message Flows on Fault Interruption
-
-### Case 1 (No Session Management)
-1. Connection drops during File 2, Byte 500,000.
-2. Client detects `recv()` return value $\le 0$.
-3. Client reconnects and sends `MSG_GET_REQ` with `Session ID = ""` and `Resume Offset = 0`.
-4. Server starts transfer from **File 0, Byte 0**.
-5. Client overwrites previously downloaded bytes (redundant retransmission).
-
-### Case 2 (Session Management & Checkpointing)
-1. Connection drops during File 2, Byte 500,000.
-2. Client updates `.session_<topic>.chk` with `Session ID = "S123"`, `File Index = 2`, `Byte Offset = 500000`.
-3. Client reconnects and sends `MSG_GET_REQ` with `Session ID = "S123"`, `Resume File Index = 2`, `Resume Byte Offset = 500000`, `Flags = RESUME`.
-4. Server validates `S123` in session table, opens File 2, performs `lseek(fd, 500000, SEEK_SET)`.
-5. Server sends `MSG_FILE_HEADER` (StartOffset = 500,000) followed by remaining data chunks.
-6. Client seeks local file descriptor to 500,000 and appends incoming chunks. Zero redundant payload bytes transmitted.
+### Explicit Scenarios & Edge Cases
+1. **Failure Before ACK:** Client writes to disk but socket closes before `MSG_ACK` reaches server. Server session retains previous committed offset $O_{committed}$. Client reconnects with request at $O_{committed}$. Server resumes at $O_{committed}$; client overwrites un-ACKed local trailing bytes.
+2. **Duplicate ACK:** Server receives duplicate `MSG_ACK` due to network reordering. Server treats operation as idempotent and updates timestamp.
+3. **File Boundary Resume:** When file $k$ completes, client sends `MSG_ACK` with `File Index = k` and `Acked Offset = FileSize_k`. Resume resumes at `File Index = k+1`, `Offset = 0`.
+4. **Final Chunk Resume:** If failure occurs on final chunk before ACK commit, resume requests start offset of final chunk.
